@@ -4,7 +4,7 @@
 
 ![License](https://img.shields.io/badge/License-GPL-green)
 
-This Bash script facilitates cloning a Proxmox virtual machine (VM) from a specific ZFS snapshot. It lists all available VMs, allows selection of a source VM, and identifies all associated ZFS datasets before creating a new cloned VM.
+This Bash script facilitates cloning a Proxmox virtual machine (VM) from a specific ZFS snapshot created by zfs-auto-snapshot. It lists all available VMs, allows selection of a source VM, and identifies all associated ZFS datasets before creating a new cloned VM.
 
 ## :warning: Critical Warning
 **This script requires root privileges and can cause data changes!**  
@@ -43,6 +43,7 @@ sudo ./pve-vm-clone-script.sh
 GPL License - See LICENSE for details.
 
 ### Key Limitations:
+- Only snapshots created by zfs-auto-snapshot are supported
 - No data integrity guarantees
 - No liability for damages
 - Not suitable for production systems without testing
