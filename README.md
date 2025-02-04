@@ -1,5 +1,5 @@
 
-# Proxmox VM Snapshot Clone :floppy_disk:
+# Proxmox VM Snapshot Clone Script :floppy_disk:
 
 ![License](https://img.shields.io/badge/License-GPL-green)
 
