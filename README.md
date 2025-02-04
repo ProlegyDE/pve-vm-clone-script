@@ -21,9 +21,10 @@ chmod +x pve-vm-clone-script.sh
 ```
 
 ## :white_check_mark: Requirements
--   Proxmox Virtual Environment (PVE)
--   ZFS storage backend (local-zfs)
--   Bash shell
+- Proxmox Virtual Environment (PVE)
+- ZFS storage backend (local-zfs)
+- zfs-auto-snapshot for snapshot management
+- Bash shell
 
 ## :computer: Features
 - Lists all available VMs and their configurations
