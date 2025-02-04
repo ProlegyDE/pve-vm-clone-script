@@ -24,7 +24,7 @@ list_snapshots() {
   zfs list -t snapshot -o name -s creation | grep "^${dataset}@"
 }
 
-echo -e "${CYAN}=== Proxmox VM Snapshot Clone Script ===${NC}\n"
+echo -e "${CYAN}=== Proxmox VM Clone Script ===${NC}\n"
 
 # 1. List VMs
 list_vms
