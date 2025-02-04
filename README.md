@@ -1,4 +1,5 @@
 
+
 # Proxmox VM Clone Script :floppy_disk:
 
 ![License](https://img.shields.io/badge/License-GPL-green)
@@ -14,9 +15,9 @@ Use only if you:
 
 ## :gear: Installation
 ```bash
-git clone https://github.com/ProlegyDE/pve-snapshot-clone-script.git
-cd pve-snapshot-clone-script
-chmod +x pve-snapshot-clone-script.sh
+git clone https://github.com/ProlegyDE/pve-vm-clone-script.git
+cd pve-vm-clone-script
+chmod +x pve-vm-clone-script.sh
 ```
 
 ## :white_check_mark: Requirements
@@ -34,7 +35,7 @@ chmod +x pve-snapshot-clone-script.sh
 
 ## :rocket: Usage
 ```bash
-sudo ./pve-snapshot-clone-script.sh
+sudo ./pve-vm-clone-script.sh
 ```
 
 ## :balance_scale: License
