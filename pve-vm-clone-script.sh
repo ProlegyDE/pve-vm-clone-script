@@ -52,7 +52,6 @@ fi
 # 3. Find disk datasets from source configuration  
 declare -A DISK_DATASETS
 echo -e "\n${CYAN}Finding ZFS datasets from $SRC_CONF ...${NC}"
-# Erfassung aller Zeilen, die mit scsi, ide, sata, virtio, efidisk oder tpmstate beginnen.
 while IFS= read -r line; do
   if [[ "$line" =~ ^(scsi|ide|sata|virtio|efidisk|tpmstate)[0-9]+:.*local-zfs:([^,]+) ]]; then
     dataset_name="${BASH_REMATCH[2]}"
@@ -69,7 +68,6 @@ if [ ${#DISK_DATASETS[@]} -eq 0 ]; then
 fi
 
 # 4. Determine reference disk
-# Zur Auswahl des Referenz-Datasets wird ausschließlich nach '-disk-' gesucht.
 min_disk=99999
 ref_disk_key=""
 for key in "${!DISK_DATASETS[@]}"; do
@@ -94,7 +92,7 @@ ref_dataset="${DISK_DATASETS[$ref_disk_key]}"
 echo -e "\n${CYAN}Reference disk: ${BLUE}$ref_disk_key${CYAN} ($ref_dataset)${NC}"
 echo -e "${CYAN}Select the snapshot:${NC}"
 
-# List snapshots for das Referenz-Dataset
+# List snapshots
 snaps=()
 while IFS= read -r snap; do
   snaps+=("$snap")
@@ -132,7 +130,6 @@ for disk in "${!DISK_DATASETS[@]}"; do
     continue
   fi
 
-  # Erzeugt den neuen Dataset-Namen, indem die alte VMID ersetzt wird.
   if [[ "$target_snapshot" =~ (rpool/data/)(vm-)([0-9]+)(-disk-.*)@.* ]]; then
     new_dataset="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${NEW_VMID}${BASH_REMATCH[4]}"
   else
@@ -167,20 +164,41 @@ done
 # 6. Create new configuration
 echo -e "\n${CYAN}Creating new VM configuration: ${BLUE}$NEW_CONF${NC}"
 > "$NEW_CONF"
+inside_snapshot=0
 while IFS= read -r line; do
-  # Hier werden alle relevanten Gerätetypen berücksichtigt, inklusive virtio.
+  # Check for the start of a snapshot section
+  if [[ "$line" =~ ^\[.*\] ]]; then
+    inside_snapshot=1
+    continue
+  fi
+
+  # Skip lines within a snapshot section
+  if (( inside_snapshot )); then
+    continue
+  fi
+
+  # Process disk lines
   if [[ "$line" =~ ^(scsi|ide|sata|virtio|efidisk|tpmstate)[0-9]+: ]]; then
     key=$(echo "$line" | cut -d: -f1)
+    found=0
     for d in "${CLONED_DISKS[@]}"; do
-      if [ "$d" == "$key" ]; then
-        # Ersetze in der Diskzeile den alten VMID-Teil durch den neuen
+      if [[ "$d" == "$key" ]]; then
         newline=$(echo "$line" | sed "s/vm-${SRC_VMID}-/vm-${NEW_VMID}-/g")
         echo "$newline" >> "$NEW_CONF"
-        continue 2
+        found=1
+        break
       fi
     done
-    echo -e "  ${YELLOW}[INFO] Skipping disk line '$key'.${NC}"
+    if (( found == 0 )); then
+      echo -e "  ${YELLOW}[INFO] Skipping disk line '$key'.${NC}"
+    fi
   else
+    # Skip parent line
+    if [[ "$line" =~ ^parent: ]]; then
+      echo -e "  ${YELLOW}[INFO] Skipping Snapshot parent line in: $line${NC}"
+      continue
+    fi
+    # Write other lines to the new config
     echo "$line" >> "$NEW_CONF"
   fi
 done < "$SRC_CONF"
