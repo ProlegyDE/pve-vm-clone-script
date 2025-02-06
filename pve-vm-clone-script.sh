@@ -52,8 +52,9 @@ fi
 # 3. Find disk datasets from source configuration  
 declare -A DISK_DATASETS
 echo -e "\n${CYAN}Finding ZFS datasets from $SRC_CONF ...${NC}"
+# Erfassung aller Zeilen, die mit scsi, ide, sata, virtio, efidisk oder tpmstate beginnen.
 while IFS= read -r line; do
-  if [[ "$line" =~ ^(scsi|ide|sata)[0-9]+:.*local-zfs:([^,]+) ]]; then
+  if [[ "$line" =~ ^(scsi|ide|sata|virtio|efidisk|tpmstate)[0-9]+:.*local-zfs:([^,]+) ]]; then
     dataset_name="${BASH_REMATCH[2]}"
     dataset="rpool/data/${dataset_name}"
     key=$(echo "$line" | cut -d: -f1)
@@ -68,11 +69,12 @@ if [ ${#DISK_DATASETS[@]} -eq 0 ]; then
 fi
 
 # 4. Determine reference disk
+# Zur Auswahl des Referenz-Datasets wird ausschließlich nach '-disk-' gesucht.
 min_disk=99999
 ref_disk_key=""
 for key in "${!DISK_DATASETS[@]}"; do
   dataset="${DISK_DATASETS[$key]}"
-  if [[ "$dataset" =~ -disk-([0-9]+)$ ]]; then
+  if [[ "$dataset" =~ -disk[-]?([0-9]+)$ ]]; then
     disknum="${BASH_REMATCH[1]}"
     if [ "$disknum" -lt "$min_disk" ]; then
       min_disk="$disknum"
@@ -92,7 +94,7 @@ ref_dataset="${DISK_DATASETS[$ref_disk_key]}"
 echo -e "\n${CYAN}Reference disk: ${BLUE}$ref_disk_key${CYAN} ($ref_dataset)${NC}"
 echo -e "${CYAN}Select the snapshot:${NC}"
 
-# List snapshots
+# List snapshots for das Referenz-Dataset
 snaps=()
 while IFS= read -r snap; do
   snaps+=("$snap")
@@ -130,6 +132,7 @@ for disk in "${!DISK_DATASETS[@]}"; do
     continue
   fi
 
+  # Erzeugt den neuen Dataset-Namen, indem die alte VMID ersetzt wird.
   if [[ "$target_snapshot" =~ (rpool/data/)(vm-)([0-9]+)(-disk-.*)@.* ]]; then
     new_dataset="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${NEW_VMID}${BASH_REMATCH[4]}"
   else
@@ -165,11 +168,13 @@ done
 echo -e "\n${CYAN}Creating new VM configuration: ${BLUE}$NEW_CONF${NC}"
 > "$NEW_CONF"
 while IFS= read -r line; do
-  if [[ "$line" =~ ^(scsi|ide|sata)[0-9]+: ]]; then
+  # Hier werden alle relevanten Gerätetypen berücksichtigt, inklusive virtio.
+  if [[ "$line" =~ ^(scsi|ide|sata|virtio|efidisk|tpmstate)[0-9]+: ]]; then
     key=$(echo "$line" | cut -d: -f1)
     for d in "${CLONED_DISKS[@]}"; do
       if [ "$d" == "$key" ]; then
-        newline=$(echo "$line" | sed "s/vm-${SRC_VMID}-disk/vm-${NEW_VMID}-disk/g")
+        # Ersetze in der Diskzeile den alten VMID-Teil durch den neuen
+        newline=$(echo "$line" | sed "s/vm-${SRC_VMID}-/vm-${NEW_VMID}-/g")
         echo "$newline" >> "$NEW_CONF"
         continue 2
       fi
