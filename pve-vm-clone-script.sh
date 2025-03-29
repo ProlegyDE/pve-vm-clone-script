@@ -8,6 +8,16 @@ CYAN='\e[96m'
 BLUE='\e[94m'
 NC='\e[0m' # No Color
 
+# Function: Format MB values to GB if >=1000
+format_mb() {
+    local mb=$1
+    if [ "$mb" -ge 1000 ]; then
+        awk -v mb="$mb" 'BEGIN {printf "%.2f GB", mb / 1000}'
+    else
+        echo "${mb} MB"
+    fi
+}
+
 # Function: List all VMs
 list_vms() {
   echo -e "${CYAN}Available VMs (VMID : Name):${NC}"
@@ -47,6 +57,46 @@ NEW_CONF="/etc/pve/qemu-server/${NEW_VMID}.conf"
 if [ -f "$NEW_CONF" ]; then
   echo -e "${RED}Error: Configuration file for VMID $NEW_VMID already exists!${NC}"
   exit 1
+fi
+
+# RAM check
+echo -e "\n${CYAN}Checking host RAM usage...${NC}"
+
+total_ram_mb=$(free -m | awk '/^Mem:/ {print $2}')
+src_vm_ram=$(qm config "$SRC_VMID" | awk '/^memory:/ {print $2}')
+if [ -z "$src_vm_ram" ]; then
+    src_vm_ram=512
+    echo -e "${YELLOW}No memory setting found for VM $SRC_VMID, assuming ${src_vm_ram} MB.${NC}"
+fi
+
+sum_running_ram=0
+# Get list of running VMs
+while IFS= read -r vm; do
+    [ -z "$vm" ] && continue
+    ram=$(qm config "$vm" | awk '/^memory:/ {print $2}')
+    sum_running_ram=$((sum_running_ram + ram))
+done < <(qm list | awk '/running/ {print $1}')
+
+threshold=$((total_ram_mb * 90 / 100))
+prognostic_ram=$((sum_running_ram + src_vm_ram))
+
+echo -e "  Total host RAM:      ${BLUE}$(format_mb ${total_ram_mb})${NC}"
+echo -e "  Running VMs RAM:     ${BLUE}$(format_mb ${sum_running_ram})${NC}"
+echo -e "  Source VM RAM:       ${BLUE}$(format_mb ${src_vm_ram})${NC}"
+echo -e "  Projected RAM:       ${BLUE}$(format_mb ${prognostic_ram})${NC}"
+echo -e "  90% Threshold:       ${BLUE}$(format_mb ${threshold})${NC}"
+
+if [ "$prognostic_ram" -gt "$threshold" ]; then
+    echo -e "${RED}WARNING: Starting the cloned VM would exceed 90% of total host RAM!${NC}"
+    echo -e "${YELLOW}This may lead to performance issues or instability.${NC}"
+    read -p "$(echo -e "${RED}Proceed with cloning? (y/N) ${NC}")" confirm
+    confirm=${confirm:-N}
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${RED}Cloning aborted by user.${NC}"
+        exit 1
+    fi
+else
+    echo -e "${GREEN}RAM check passed. Projected usage is below 90%.${NC}"
 fi
 
 # 3. Find disk datasets from source configuration  
