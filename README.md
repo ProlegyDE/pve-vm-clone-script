@@ -1,7 +1,9 @@
 # Proxmox VM Clone Script :floppy_disk:
 
-![Python Version](https://img.shields.io/badge/Python-3.6%2B-blue)
+![Python Version](https://img.shields.io/badge/Python-3.7%2B-blue)
 ![License](https://img.shields.io/badge/License-GPL-green)
+
+This Python script facilitates cloning Proxmox virtual machines (VMs) and LXC containers from ZFS snapshots. It lists all available instances, performs safety checks, and creates optimized clones with adjusted configurations.
 
 ## :warning: Critical Warning
 
@@ -35,6 +37,7 @@ chmod +x pve-vm-clone-script.py
 *   Automatic RAM usage analysis for VMs
 *   ZFS dataset detection and validation
 *   Configuration auto-adjustments for safe cloning
+*   Support for zfs-auto-snapshot patterns
 
 ## :rocket: Usage
 
@@ -56,14 +59,17 @@ GPL-3.0 License - See [LICENSE](LICENSE) for details.
 
 THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY. THE AUTHOR SHALL NOT BE LIABLE FOR:
 
-*   Storage pool exhaustion
-*   Network configuration conflicts
-*   System instability from resource overcommitment
+*   Data loss/corruption
+*   System failures
+*   Direct/indirect damages from usage
+*   Incompatibilities with specific system configurations
+
+Use only on test systems or after thorough validation.
 
 ## :handshake: Contributing
 
 Contributions welcome! Please:
 
-1.  Test Python 3.7+ compatibility
-2.  Document new features clearly
-3.  Maintain color-output consistency
+1.  Use Issues for bug reports
+2.  Submit Pull Requests with change descriptions
+3.  Avoid breaking changes without discussion
