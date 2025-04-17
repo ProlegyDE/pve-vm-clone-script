@@ -1,63 +1,69 @@
-
-
 # Proxmox VM Clone Script :floppy_disk:
 
+![Python Version](https://img.shields.io/badge/Python-3.6%2B-blue)
 ![License](https://img.shields.io/badge/License-GPL-green)
 
-This Bash script facilitates cloning a Proxmox virtual machine (VM) from a specific ZFS snapshot. It lists all available VMs, allows selection of a source VM, and identifies all associated ZFS datasets before creating a new cloned VM.
-
 ## :warning: Critical Warning
-**This script requires root privileges and can cause data changes!**  
+
+This script requires root privileges and modifies system configurations!
+
 Use only if you:
-- Are familiar with Proxmox VE/ZFS system administration
-- Understand the consequences of ZFS commands
-- Maintain regular data backups
+
+*   Are familiar with Proxmox VE/ZFS administration
+*   Understand ZFS cloning mechanics
+*   Maintain regular backups
 
 ## :gear: Installation
-```bash
+
+```
 git clone https://github.com/ProlegyDE/pve-vm-clone-script.git
 cd pve-vm-clone-script
-chmod +x pve-vm-clone-script.sh
+chmod +x pve-vm-clone-script.py
 ```
 
 ## :white_check_mark: Requirements
-- Proxmox Virtual Environment (PVE)
-- ZFS storage backend (local-zfs)
-- Bash shell
+
+*   Proxmox Virtual Environment (PVE 7+)
+*   ZFS storage backend (local-zfs)
+*   Python 3.7+
+*   Root access
 
 ## :computer: Features
-- Lists all available VMs and their configurations
-- Detects ZFS disk datasets linked to the selected VM
-- Displays available snapshots for the primary disk dataset
-- Clones selected snapshots and assigns them to a new VM
-- Generates a new VM configuration file with necessary adjustments
-- Provides color-coded output for better readability
-- Snapshots created by zfs-auto-snapshot are also supported
+
+*   Supports both **VMs and LXC containers**
+*   Interactive CLI with color-coded output
+*   Automatic RAM usage analysis for VMs
+*   ZFS dataset detection and validation
+*   Configuration auto-adjustments for safe cloning
 
 ## :rocket: Usage
-```bash
-sudo ./pve-vm-clone-script.sh
+
+```
+sudo ./pve-vm-clone-script.py
 ```
 
 ## :balance_scale: License
-GPL License - See LICENSE for details.
+
+GPL-3.0 License - See [LICENSE](LICENSE) for details.
 
 ### Key Limitations:
-- No data integrity guarantees
-- No liability for damages
-- Not suitable for production systems without testing
+
+*   Requires pre-existing ZFS snapshots
+*   First-run RAM check only for VMs
+*   EFI disk handling requires manual verification
 
 ## :page_facing_up: Disclaimer
-THIS SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND. THE AUTHOR SHALL NOT BE HELD LIABLE FOR:
-- Data loss/corruption
-- System failures
-- Direct/indirect damages from usage
-- Incompatibilities with specific system configurations
 
-Use only on test systems or after thorough validation.
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY. THE AUTHOR SHALL NOT BE LIABLE FOR:
+
+*   Storage pool exhaustion
+*   Network configuration conflicts
+*   System instability from resource overcommitment
 
 ## :handshake: Contributing
-Contributions are welcome! Please:
-- Use Issues for bug reports
-- Submit Pull Requests with change descriptions
-- Avoid breaking changes without discussion
+
+Contributions welcome! Please:
+
+1.  Test Python 3.7+ compatibility
+2.  Document new features clearly
+3.  Maintain color-output consistency
