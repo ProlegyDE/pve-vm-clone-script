@@ -37,9 +37,9 @@ chmod +x pve-vm-clone-script.py
 *   Interactive CLI with color-coded output
 *   Offers both linked clones (ZFS clones) and full clones (ZFS send/receive)
 *   Automatically adjusts configuration files:
-    *   Adds "clone-" prefix to names/hostnames
-    *   Sets `onboot: 0`
-    *   Adds `link_down=1` to network interfaces
+  *   Adds "clone-" prefix to names/hostnames
+  *   Sets `onboot: 0`
+  *   Adds `link_down=1` to network interfaces
 *   Includes RAM usage check before cloning VMs
 *   Progress display for full clones (when `pv` is available)
 *   Support for zfs-auto-snapshot patterns
