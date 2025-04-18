@@ -3,7 +3,7 @@
 ![Python Version](https://img.shields.io/badge/Python-3.7%2B-blue)
 ![License](https://img.shields.io/badge/License-GPL-green)
 
-This Python script facilitates cloning Proxmox virtual machines (VMs) and LXC containers from ZFS snapshots. It lists all available instances, performs safety checks, and creates optimized clones with adjusted configurations.
+This Python script facilitates cloning Proxmox virtual machines (VMs) and LXC containers from ZFS snapshots, supporting both linked clones and full clones. It lists all available instances, performs safety checks, and creates optimized clones with adjusted configurations.
 
 ## :warning: Critical Warning
 
@@ -25,18 +25,23 @@ chmod +x pve-vm-clone-script.py
 
 ## :white_check_mark: Requirements
 
-*   Proxmox Virtual Environment (PVE 7+)
-*   ZFS storage backend (local-zfs)
+*   Proxmox VE environment
+*   ZFS storage configured with `local-zfs`
 *   Python 3.7+
-*   Root access
+*   Required system tools: `zfs`, `qm` (for VMs), `pct` (for LXC)
+*   Recommended: `pv` (Pipe Viewer) for progress display during full clones
 
 ## :computer: Features
 
 *   Supports both **VMs and LXC containers**
 *   Interactive CLI with color-coded output
-*   Automatic RAM usage analysis for VMs
-*   ZFS dataset detection and validation
-*   Configuration auto-adjustments for safe cloning
+*   Offers both linked clones (ZFS clones) and full clones (ZFS send/receive)
+*   Automatically adjusts configuration files:
+    *   Adds "clone-" prefix to names/hostnames
+    *   Sets `onboot: 0`
+    *   Adds `link_down=1` to network interfaces
+*   Includes RAM usage check before cloning VMs
+*   Progress display for full clones (when `pv` is available)
 *   Support for zfs-auto-snapshot patterns
 
 ## :rocket: Usage
