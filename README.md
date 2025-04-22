@@ -14,6 +14,7 @@ Use only if you:
 *   Are familiar with Proxmox VE/ZFS administration
 *   Understand ZFS cloning mechanics
 *   Maintain regular backups
+*   Have tested in a non-production environment
 
 ## :gear: Installation
 
@@ -26,7 +27,7 @@ chmod +x pve-vm-clone-script.py
 ## :white_check_mark: Requirements
 
 *   Proxmox VE environment
-*   ZFS storage configured with `local-zfs`
+*   ZFS storage configured (default: `local-zfs`)
 *   Python 3.7+
 *   Required system tools: `zfs`, `qm` (for VMs), `pct` (for LXC)
 *   Recommended: `pv` (Pipe Viewer) for progress display during full clones
@@ -35,12 +36,16 @@ chmod +x pve-vm-clone-script.py
 
 *   Supports both **VMs and LXC containers**
 *   Interactive CLI with color-coded output
-*   Offers both linked clones (ZFS clones) and full clones (ZFS send/receive)
+*   Dual clone modes:
+    *   Linked clones (space-efficient ZFS clones)
+    *   Full clones (independent ZFS send/receive)
 *   Automatically adjusts configuration files:
     *   Adds "clone-" prefix to names/hostnames
     *   Sets `onboot: 0`
     *   Adds `link_down=1` to network interfaces
-*   Includes RAM usage check before cloning VMs
+*   Handles complex storage configurations (multiple disks, EFI, etc.)
+*   RAM usage verification before VM cloning (configurable threshold)
+*   Collision detection for VM IDs and ZFS datasets
 *   Progress display for full clones (when `pv` is available)
 *   Support for zfs-auto-snapshot patterns
 
@@ -48,6 +53,24 @@ chmod +x pve-vm-clone-script.py
 
 ```
 sudo ./pve-vm-clone-script.py
+```
+
+The script will guide you through:
+
+1. Instance selection (VM/LXC)
+2. Clone mode selection
+3. Snapshot selection
+4. Safety checks
+5. Automated cloning process
+
+## :wrench: Configuration
+
+You can modify these defaults at the script's header:
+
+```
+DEFAULT_ZFS_POOL_PATH = "rpool/data"  # Default ZFS pool path
+DEFAULT_PVE_STORAGE = "local-zfs"     # Default Proxmox storage name
+RAM_THRESHOLD_PERCENT = 90            # RAM usage threshold for warnings
 ```
 
 ## :balance_scale: License
