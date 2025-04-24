@@ -1219,7 +1219,7 @@ def do_export(args):
 
     metadata = {
         "exported_at": datetime.now().isoformat(),
-        "script_version": "pve-zfs-clone-script-v_adjusted", # Add a version marker if desired
+        "script_version": "pve-zfs-utility-v_adjusted", # Add a version marker if desired
         "source_id": src_id,
         "source_instance_type": src_instance_type,
         "source_config_file": config_export_path.name,
