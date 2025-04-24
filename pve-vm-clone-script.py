@@ -10,19 +10,31 @@ import shutil
 import tempfile
 from datetime import datetime
 import math
+import argparse
+import json
 
+# --- Default Configuration ---
+# These are now the *defaults* for target paths/storage during clone/restore.
+# They can be overridden by command-line arguments.
 DEFAULT_ZFS_POOL_PATH = "rpool/data"
 DEFAULT_PVE_STORAGE = "local-zfs"
 RAM_THRESHOLD_PERCENT = 90
+DEFAULT_EXPORT_META_SUFFIX = ".meta.json"
+DEFAULT_EXPORT_DATA_SUFFIX = ".zfs.stream"
+DEFAULT_EXPORT_CONFIG_SUFFIX = ".conf"
 
+
+# --- Colors ---
 COLORS = {
     "RED": '\033[91m',
     "GREEN": '\033[92m',
     "YELLOW": '\033[93m',
     "CYAN": '\033[96m',
     "BLUE": '\033[94m',
-    "NC": '\033[0m'
+    "NC": '\033[0m'  # No Color
 }
+
+# --- Helper Functions ---
 
 def color_text(text, color_name):
     """Färbt den Text für die Konsolenausgabe."""
@@ -42,120 +54,193 @@ def print_warning(text):
     """Gibt eine Warnmeldung aus."""
     print(color_text(text, "YELLOW"))
 
-def print_error(text):
-    """Gibt eine Fehlermeldung aus."""
+def print_error(text, exit_code=None):
+    """Gibt eine Fehlermeldung aus und beendet das Skript optional."""
     print(color_text(text, "RED"), file=sys.stderr)
+    if exit_code is not None:
+        sys.exit(exit_code)
 
 def is_tool(name):
     """Prüft, ob ein Kommandozeilen-Tool im PATH verfügbar ist."""
     return shutil.which(name) is not None
 
-def run_command(cmd_list, check=True, capture_output=True, text=True, error_msg=None, suppress_stderr=False, input_data=None):
-    """Führt einen Shell-Befehl aus und gibt die Ausgabe zurück."""
+def run_command(cmd_list, check=True, capture_output=True, text=True, error_msg=None, suppress_stderr=False, input_data=None, allow_fail=False):
+    """
+    Führt einen Shell-Befehl aus und gibt die Ausgabe zurück oder prüft auf Erfolg.
+
+    Args:
+        cmd_list (list): The command and its arguments.
+        check (bool): If True, raise CalledProcessError on non-zero exit code (unless allow_fail=True).
+        capture_output (bool): If True, capture stdout and stderr. If False, output goes to console.
+        text (bool): If True, decode stdout/stderr as text.
+        error_msg (str, optional): Custom error message on failure.
+        suppress_stderr (bool): If True and capture_output=True, redirect stderr to DEVNULL.
+        input_data (str, optional): Data to pass to the command's stdin.
+        allow_fail (bool): If True, don't raise an exception on failure, instead return (success, stdout, stderr).
+
+    Returns:
+        str: Captured stdout if capture_output=True and allow_fail=False.
+        tuple: (bool, str, str) representing (success, stdout, stderr) if allow_fail=True.
+        None: If capture_output=False and allow_fail=False.
+
+    Raises:
+        SystemExit: On command not found or execution error (if check=True and allow_fail=False).
+    """
     stdin_setting = subprocess.PIPE if input_data is not None else None
-    stdout_setting = None if capture_output else None
-    stderr_setting = subprocess.DEVNULL if suppress_stderr else None
+
+    # Determine stdout/stderr based on capture_output and suppress_stderr
+    if capture_output:
+        stdout_setting = subprocess.PIPE
+        stderr_setting = subprocess.DEVNULL if suppress_stderr else subprocess.PIPE
+    else:
+        stdout_setting = None # Output goes to console/parent process stdout
+        stderr_setting = subprocess.DEVNULL if suppress_stderr else None # Stderr to DEVNULL or console/parent
 
     try:
         process = subprocess.run(
             cmd_list,
-            check=check,
-            capture_output=capture_output,
+            check=check and not allow_fail, # Don't check if allow_fail is True
             text=text,
-            stdout=stdout_setting if not capture_output else None,
-            stderr=stderr_setting if not capture_output else None,
+            stdout=stdout_setting,
+            stderr=stderr_setting,
             input=input_data,
-            stdin=stdin_setting
+            stdin=stdin_setting,
+            errors='replace' # Replace decoding errors if text=True
         )
-        return process.stdout.strip() if capture_output and process.stdout else ""
+        # Read stdout/stderr from process object if PIPE was used
+        stdout_res = process.stdout.strip() if stdout_setting == subprocess.PIPE and process.stdout else ""
+        stderr_res = process.stderr.strip() if stderr_setting == subprocess.PIPE and process.stderr else ""
+
+        if allow_fail:
+            return (process.returncode == 0, stdout_res, stderr_res)
+        else:
+            # If check=False and it failed, stdout_res might still be useful
+            if process.returncode != 0:
+                 # Optionally warn if check=False but command failed
+                 # print_warning(f"Command '{' '.join(cmd_list)}' failed with rc={process.returncode} but check=False.")
+                 pass
+            # Return stdout if captured, otherwise None
+            return stdout_res if capture_output else None
 
     except FileNotFoundError:
         msg = error_msg or f"Error: Command '{cmd_list[0]}' not found."
-        print_error(msg)
-        sys.exit(1)
+        print_error(msg, exit_code=1)
     except subprocess.CalledProcessError as e:
-        msg = error_msg or f"Error executing '{' '.join(cmd_list)}'"
-        print_error(f"{msg}\nReturn Code: {e.returncode}")
-        stderr_content = e.stderr.strip() if hasattr(e, 'stderr') and e.stderr else ""
-        if not suppress_stderr and stderr_content:
-             print_error(f"Stderr:\n{stderr_content}")
-        elif capture_output and hasattr(e, 'stdout') and e.stdout and (suppress_stderr or not stderr_content):
-            stdout_content = e.stdout.strip()
-            if stdout_content:
-                print_error(f"Stdout:\n{stdout_content}")
-        sys.exit(1)
+        if allow_fail:
+            stdout = e.stdout.strip() if hasattr(e, 'stdout') and e.stdout else ""
+            stderr = e.stderr.strip() if hasattr(e, 'stderr') and e.stderr else ""
+            return (False, stdout, stderr)
+        else:
+            msg = error_msg or f"Error executing '{' '.join(cmd_list)}'"
+            print_error(f"{msg}\nReturn Code: {e.returncode}")
+            stderr_content = e.stderr.strip() if hasattr(e, 'stderr') and e.stderr else ""
+            # Only print stderr if it wasn't suppressed during the call
+            if not suppress_stderr and stderr_content:
+                 print_error(f"Stderr:\n{stderr_content}")
+            # Maybe print stdout if stderr was empty/suppressed and stdout exists
+            elif hasattr(e, 'stdout') and e.stdout and (suppress_stderr or not stderr_content):
+                stdout_content = e.stdout.strip()
+                if stdout_content:
+                    print_error(f"Stdout (relevant for error?):\n{stdout_content}")
+            sys.exit(1)
     except Exception as e:
         msg = error_msg or f"Unexpected error executing '{' '.join(cmd_list)}'"
-        print_error(f"{msg}: {e}")
-        sys.exit(1)
+        print_error(f"{msg}: {e}", exit_code=1)
 
-def run_pipeline(commands, step_names=None):
-    """Führt eine Befehlspipeline aus (z.B. zfs send | pv | zfs recv)."""
+
+def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
+    """
+    Führt eine Befehlspipeline aus (z.B. cmd1 | pv | cmd2).
+    Kann die Ausgabe des letzten Befehls in eine Datei umleiten.
+
+    Args:
+        commands (list[list[str]]): List of commands, where each command is a list of strings.
+        step_names (list[str], optional): Names for each step for logging.
+        pv_options (list[str], optional): Options to pass to the 'pv' command if present.
+        output_file (Path, optional): Path object to redirect the final command's stdout to.
+
+    Returns:
+        bool: True if the entire pipeline completed successfully, False otherwise.
+    """
     processes = []
     num_commands = len(commands)
     if step_names is None:
         step_names = [f"Step {i+1}" for i in range(num_commands)]
 
     process_info = []
+    final_output_handle = None
 
     try:
         last_process_stdout = None
 
+        # Open output file if specified (use binary mode for streams)
+        if output_file:
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            final_output_handle = open(output_file, 'wb')
+
         for i, cmd in enumerate(commands):
             stdin_source = last_process_stdout
-            stdout_dest = subprocess.PIPE if i < num_commands - 1 else None
+            # Determine stdout destination: pipe to next command or to file/stdout
+            is_last_command = (i == num_commands - 1)
+            stdout_dest = final_output_handle if is_last_command and final_output_handle else subprocess.PIPE
 
             is_pv_command = (cmd[0] == 'pv')
-            stderr_dest = subprocess.PIPE if not is_pv_command else None
-            capture_stderr_flag = (stderr_dest == subprocess.PIPE)
+            # Let pv write to stderr for progress, capture others' stderr
+            stderr_dest = None if is_pv_command else subprocess.PIPE
+
+            # Add pv options if this is the pv command
+            current_cmd = cmd[:] # Copy
+            if is_pv_command and pv_options:
+                current_cmd.extend(pv_options)
 
             proc = subprocess.Popen(
-                cmd,
+                current_cmd,
                 stdin=stdin_source,
                 stdout=stdout_dest,
                 stderr=stderr_dest,
-                text=True,
-                errors='ignore',
-                bufsize=1
+                # No text mode here - handle binary streams like zfs send/recv correctly
+                bufsize=8192 # Good buffer size for streams
             )
             processes.append(proc)
-            process_info.append({'proc': proc, 'capture_stderr': capture_stderr_flag, 'command': cmd})
+            process_info.append({'proc': proc, 'command': current_cmd})
 
+            # Close the previous process's stdout pipe if it exists
+            # This is important to prevent deadlocks and allow SIGPIPE propagation
             if stdin_source:
                 stdin_source.close()
 
-            last_process_stdout = proc.stdout if stdout_dest == subprocess.PIPE else None
+            # The stdout of the current process becomes the stdin for the next,
+            # unless it's the last command writing to a file/stdout.
+            if not (is_last_command and final_output_handle):
+                 last_process_stdout = proc.stdout
 
+
+        # --- Wait for completion and check results ---
         return_codes = []
-        stderr_outputs = []
+        stderr_outputs = [] # Store captured stderr
         success = True
+        timed_out = False
+
         for idx, info in enumerate(process_info):
             proc = info['proc']
-            capture_stderr_flag = info['capture_stderr']
             cmd = info['command']
+            is_pv = cmd[0] == 'pv'
+            capture_stderr = not is_pv # Only capture stderr if it wasn't pv
 
             try:
-                stdout_data, stderr_data = proc.communicate(timeout=3600)
-            except subprocess.TimeoutExpired:
-                print_error(f"Pipeline timed out at {step_names[idx]}: '{' '.join(cmd)}'")
-                proc.kill()
-                stdout_data, stderr_data = proc.communicate()
-                success = False
-                stderr_content = stderr_data.strip() if capture_stderr_flag and stderr_data else ""
-                stderr_outputs.append(stderr_content)
-                break
-            except Exception as comm_err:
-                print_error(f"Error during communicate() for {step_names[idx]} ('{' '.join(cmd)}'): {comm_err}")
-                stderr_content = ""
-                stderr_outputs.append(stderr_content)
-                success = False
-                rc = proc.returncode if proc.returncode is not None else 1
-
-            if success:
+                # Communicate captures remaining stdout/stderr from pipes
+                # Timeout is important for potentially long operations
+                stdout_data, stderr_data = proc.communicate(timeout=7200) # 2 hours
                 rc = proc.returncode
                 return_codes.append(rc)
 
-                stderr_content = stderr_data.strip() if capture_stderr_flag and stderr_data else ""
+                stderr_content = ""
+                if capture_stderr and stderr_data:
+                    try:
+                        # Try decoding stderr as utf-8, replace errors
+                        stderr_content = stderr_data.decode('utf-8', errors='replace').strip()
+                    except Exception: # Fallback if decoding fails entirely
+                        stderr_content = "<Could not decode stderr>"
                 stderr_outputs.append(stderr_content)
 
                 if rc != 0:
@@ -163,67 +248,124 @@ def run_pipeline(commands, step_names=None):
                     print_error(f"Pipeline failed at {step_names[idx]}: '{' '.join(cmd)}' (rc={rc})")
                     if stderr_content:
                         print_error(f"Stderr:\n{stderr_content}")
-            else:
-                # Wenn ein vorheriger Schritt fehlgeschlagen ist, füge leere Stderr für die restlichen hinzu
+                    # Mark as failed, but let remaining communicate calls finish
+
+            except subprocess.TimeoutExpired:
+                print_error(f"Pipeline timed out at {step_names[idx]}: '{' '.join(cmd)}'")
+                proc.kill()
+                # Try to communicate again to get any remaining output
+                stdout_data, stderr_data = proc.communicate()
+                success = False
+                timed_out = True
+                return_codes.append(proc.returncode if proc.returncode is not None else -1)
+                stderr_content = "<Timeout>"
+                if capture_stderr and stderr_data:
+                    try: stderr_content = stderr_data.decode('utf-8', errors='replace').strip()
+                    except Exception: pass
+                stderr_outputs.append(stderr_content)
+                break # Exit loop on timeout
+            except Exception as comm_err:
+                print_error(f"Error during communicate() for {step_names[idx]} ('{' '.join(cmd)}'): {comm_err}")
+                success = False
+                rc = proc.returncode if proc.returncode is not None else 1
                 return_codes.append(rc)
-                if len(stderr_outputs) == idx:
-                     stderr_outputs.append("")
+                stderr_outputs.append(f"<Communication Error: {comm_err}>")
 
-        # Stelle sicher, dass alle Prozesse beendet sind
-        for proc in processes:
-            proc.poll() # Warte kurz, falls noch nicht beendet
 
-        # Endgültige Erfolgsprüfung
-        if success and (len(return_codes) != num_commands or any(rc != 0 for rc in return_codes)):
-             print_warning("Pipeline completed but might have had unreported issues. Marking as failed.")
+        # Fill lists if loop broke early
+        while len(return_codes) < num_commands: return_codes.append(None)
+        while len(stderr_outputs) < num_commands: stderr_outputs.append("<Not executed or error>")
+
+        # Ensure all processes are cleaned up
+        for p_info in process_info:
+             try:
+                 if p_info['proc'].poll() is None: # Still running?
+                    p_info['proc'].terminate()
+                    p_info['proc'].wait(timeout=5)
+             except ProcessLookupError: pass
+             except Exception: pass # Ignore cleanup errors
+             finally: # Ensure pipes are closed even if termination failed
+                 if p_info['proc'].stdin:
+                     try: p_info['proc'].stdin.close()
+                     except Exception: pass
+                 if p_info['proc'].stdout:
+                     try: p_info['proc'].stdout.close()
+                     except Exception: pass
+                 if p_info['proc'].stderr:
+                     try: p_info['proc'].stderr.close()
+                     except Exception: pass
+
+        # Close the output file handle if it was opened
+        if final_output_handle:
+            final_output_handle.close()
+
+
+        # Final success check
+        if success and any(rc is None or rc != 0 for rc in return_codes):
+            print_warning("Pipeline completed but some steps failed or didn't finish correctly.")
+            success = False
+        elif timed_out:
+             print_error("Pipeline terminated due to timeout.")
              success = False
+
+        # If pipeline failed and an output file was specified, try to remove it
+        if not success and output_file and output_file.exists():
+             print_warning(f"Attempting to remove incomplete output file: {output_file}")
+             try: output_file.unlink()
+             except OSError as del_err: print_warning(f"Could not remove file: {del_err}")
+
 
         return success
 
     except FileNotFoundError as e:
         print_error(f"Error in pipeline: Command '{e.filename}' not found.")
+        # Cleanup already attempted processes
         for info in process_info:
             try: info['proc'].terminate()
-            except ProcessLookupError: pass # Prozess schon beendet
+            except Exception: pass
+        if final_output_handle: final_output_handle.close()
+        # Attempt to remove potentially created file
+        if output_file and output_file.exists():
+            try: output_file.unlink()
+            except OSError: pass
         return False
     except Exception as e:
         print_error(f"Unexpected error during pipeline setup or execution: {e}")
         for info in process_info:
             try: info['proc'].terminate()
-            except ProcessLookupError: pass # Prozess schon beendet
+            except Exception: pass
+        if final_output_handle: final_output_handle.close()
+        if output_file and output_file.exists():
+            try: output_file.unlink()
+            except OSError: pass
         return False
 
 
 def format_bytes(b):
-    """Formatiert Bytes in eine lesbare Größe (B, KB, MB, GB)."""
+    """Formatiert Bytes in eine lesbare Größe (B, KB, MB, GB, TB)."""
     if b is None: return "N/A"
     try:
         b = float(b)
-        if b < 1024:
-            return f"{int(b)} B"
-        elif b < 1024**2:
-            return f"{b / 1024:.1f} KB"
-        elif b < 1024**3:
-            return f"{b / (1024**2):.2f} MB"
-        else:
-            return f"{b / (1024**3):.2f} GB"
-    except (ValueError, TypeError):
+        if b == 0: return "0 B" # Handle 0 explicitly
+        power = math.floor(math.log(abs(b), 1024))
+        unit = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'][max(0, min(power, 6))]
+        val = b / (1024**power)
+        if unit == 'B': return f"{int(val)} {unit}"
+        elif unit in ['KB', 'MB']: return f"{val:.1f} {unit}"
+        else: return f"{val:.2f} {unit}"
+    except (ValueError, TypeError, OverflowError):
         return "N/A"
+
 
 def parse_size_to_mb(size_str):
     """Konvertiert Größenangaben (z.B. '8G', '8192M', '8192') in Megabytes."""
     size_str = str(size_str).strip().upper()
-    if not size_str:
-        return 0
-    if size_str.endswith('G'):
-        return int(float(size_str[:-1]) * 1024)
-    elif size_str.endswith('M'):
-        return int(float(size_str[:-1]))
-    elif size_str.isdigit():
-        # Assume MB if only digits are given
-        return int(size_str)
+    if not size_str: return 0
+    if size_str.endswith('G'): return int(float(size_str[:-1]) * 1024)
+    elif size_str.endswith('M'): return int(float(size_str[:-1]))
+    elif size_str.endswith('T'): return int(float(size_str[:-1]) * 1024 * 1024) # Terabytes
+    elif size_str.isdigit(): return int(size_str) # Assume MB
     else:
-        # Try to extract leading number if unit is missing or unknown
         match = re.match(r'^(\d+(\.\d+)?)', size_str)
         if match:
             print_warning(f"Unknown/missing unit in '{size_str}', interpreting as MB.")
@@ -236,24 +378,25 @@ def get_instance_details(conf_path):
     instance_id = Path(conf_path).stem
     name = "<no name/hostname>"
     is_lxc = 'lxc' in conf_path.parts
+    config_type = "VM" if 'qemu-server' in conf_path.parts else "LXC"
 
     try:
         with open(conf_path, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line.startswith('['):
-                    break # Stop reading if a snapshot section begins
+                # Stop at snapshot sections or comments
+                if line.startswith('[') or line.startswith('#'): continue
 
                 if line.startswith('name:'):
                     name = line.split(':', 1)[1].strip()
-                    if 'qemu-server' in conf_path.parts: break # For VMs, name is usually enough
+                    # For VMs, name is usually enough, but keep looking for hostname in LXC
                 elif is_lxc and line.startswith('hostname:'):
-                     # For LXC, use hostname if name wasn't found yet
+                     # Use hostname for LXC if name wasn't explicitly set
                      if name == "<no name/hostname>": name = line.split(':', 1)[1].strip()
-                     break
+                     break # Hostname is definitive for LXC if name isn't set
     except Exception as e:
         print_warning(f"Could not fully read configuration file {conf_path}: {e}")
-    return instance_id, name
+    return instance_id, name, config_type
 
 def list_instances():
     """Listet alle verfügbaren VMs und LXC-Container auf."""
@@ -266,7 +409,7 @@ def list_instances():
     print(f" {color_text('VMs:', 'YELLOW')}")
     if vm_conf_files:
         for conf in vm_conf_files:
-            vm_id, vm_name = get_instance_details(Path(conf))
+            vm_id, vm_name, _ = get_instance_details(Path(conf))
             vms.append({'id': vm_id, 'name': vm_name})
             print(f"   {color_text(vm_id, 'BLUE')} : {vm_name}")
     else:
@@ -275,7 +418,7 @@ def list_instances():
     print(f"\n {color_text('LXC Containers:', 'YELLOW')}")
     if lxc_conf_files:
         for conf in lxc_conf_files:
-            lxc_id, lxc_name = get_instance_details(Path(conf))
+            lxc_id, lxc_name, _ = get_instance_details(Path(conf))
             lxcs.append({'id': lxc_id, 'name': lxc_name})
             print(f"   {color_text(lxc_id, 'BLUE')} : {lxc_name}")
     else:
@@ -286,300 +429,375 @@ def list_instances():
         return False
     return True
 
+
+def find_instance_config(instance_id):
+    """Findet den Konfigurationspfad für eine VM oder LXC ID."""
+    vm_conf = Path(f"/etc/pve/qemu-server/{instance_id}.conf")
+    lxc_conf = Path(f"/etc/pve/lxc/{instance_id}.conf")
+    if vm_conf.is_file(): return vm_conf, "vm"
+    if lxc_conf.is_file(): return lxc_conf, "lxc"
+    return None, None
+
 def list_snapshots(dataset):
     """Listet ZFS-Snapshots für ein gegebenes Dataset auf."""
     cmd = ['zfs', 'list', '-t', 'snapshot', '-o', 'name,creation', '-s', 'creation', '-H', '-p', dataset]
-    output = run_command(cmd, check=False, capture_output=True, suppress_stderr=True, error_msg=f"Failed to list snapshots for {dataset}")
+    success, output, stderr = run_command(cmd, check=False, capture_output=True, suppress_stderr=True, allow_fail=True, error_msg=f"Failed to list snapshots for {dataset}")
     snapshots = []
-    if output:
+    if success and output:
         for line in output.strip().split('\n'):
             if line.startswith(f"{dataset}@"):
                 try:
                     name, creation_ts = line.split('\t')
                     snapshots.append({'name': name, 'creation_timestamp': int(creation_ts)})
                 except ValueError:
-                    # Fallback falls die Ausgabe anders ist (z.B. nur Name)
                     print_warning(f"Could not parse snapshot line: {line}")
+                    # Fallback: add with timestamp 0 if parsing fails
                     if line.startswith(f"{dataset}@"):
-                         snapshots.append({'name': line.strip(), 'creation_timestamp': 0}) # Timestamp 0 indicates unknown
+                         snapshots.append({'name': line.strip(), 'creation_timestamp': 0})
+    elif not success and "dataset does not exist" not in stderr:
+         print_warning(f"Could not list snapshots for {dataset}. Stderr: {stderr}")
     return snapshots
 
+
 def get_zfs_property(target, property_name):
-    """Ruft einen bestimmten ZFS-Property-Wert ab."""
+    """Ruft einen bestimmten ZFS-Property-Wert ab. Gibt None zurück, wenn nicht gefunden."""
     cmd = ['zfs', 'get', '-H', '-p', '-o', 'value', property_name, target]
-    return run_command(cmd, check=False, capture_output=True, suppress_stderr=True).strip()
+    # Use allow_fail to handle non-existent datasets/snapshots gracefully
+    success, output, stderr = run_command(cmd, check=False, capture_output=True, suppress_stderr=True, allow_fail=True)
+    if success:
+        return output.strip()
+    else:
+        # Check stderr for specific 'does not exist' messages if needed for debugging
+        # if "does not exist" in stderr:
+        #     pass # Expected for non-existent targets
+        return None
 
 def get_snapshot_size_estimate(snapshot_name):
     """Schätzt die Größe eines ZFS-Snapshots für 'zfs send'."""
-    # Verwende die Option -nP (dry run, parsable output) für die Größe
     cmd = ['zfs', 'send', '-nP', snapshot_name]
-    output = run_command(cmd, check=False, capture_output=True, suppress_stderr=True)
-    if output:
-        # Suche nach der Zeile "size <bytes>"
+    success, output, stderr = run_command(cmd, check=False, capture_output=True, suppress_stderr=True, allow_fail=True)
+    if success and output:
         match = re.search(r'^size\s+(\d+)$', output, re.MULTILINE)
-        if match:
-            return int(match.group(1))
-    print_warning(f"Could not estimate size for snapshot {snapshot_name}.")
-    return None # Gibt None zurück, wenn die Größe nicht ermittelt werden kann
+        if match: return int(match.group(1))
+    # Don't warn here, it's called per disk, could be noisy
+    # print_warning(f"Could not estimate size for snapshot {snapshot_name}. Stderr: {stderr}")
+    return None
 
-def adjust_config_file(conf_path, instance_type):
-    """Nimmt Standardanpassungen an der geklonten Konfigurationsdatei vor."""
-    print_info(f"\nApplying standard adjustments to {color_text(str(conf_path), 'BLUE')}")
+def adjust_config_file(conf_path, instance_type, new_id=None, target_pve_storage=None, dataset_map=None, name_prefix="clone-"):
+    """
+    Nimmt Anpassungen an einer Konfigurationsdatei für Klonen oder Wiederherstellen vor.
+
+    Args:
+        conf_path (Path): Path to the configuration file to adjust.
+        instance_type (str): 'vm' or 'lxc'.
+        new_id (str, optional): The new ID (not used directly for adjustments, but conceptually relevant).
+        target_pve_storage (str): The PVE storage name to use for ZFS volumes in the adjusted config.
+        dataset_map (dict): Maps original config keys (e.g., 'scsi0', 'rootfs') to new ZFS dataset basenames.
+        name_prefix (str): Prefix to add to the 'name' or 'hostname' property.
+    """
+    print_info(f"\nAdjusting configuration file: {color_text(str(conf_path), 'BLUE')}")
+    if not conf_path.is_file():
+        print_error(f"Config file {conf_path} not found for adjustments.", exit_code=1)
+
     try:
         with open(conf_path, 'r') as f_orig:
             lines = f_orig.readlines()
 
         modified_lines = []
         changes_made = False
-        name_prefix = "clone-" # Präfix für geklonte Instanzen
+        # Use target_pve_storage if provided, otherwise fallback to the script default
+        pve_storage_to_use = target_pve_storage if target_pve_storage else DEFAULT_PVE_STORAGE
 
-        for line in lines:
+        # Regex to find storage lines (match any storage initially, then verify)
+        storage_regex_vm = re.compile(r'^(scsi|ide|sata|virtio|efidisk|tpmstate)(\d+):\s*([^#]+)')
+        storage_regex_lxc = re.compile(r'^(rootfs|mp\d+):\s*([^#]+)')
+
+        processing_active_config = True
+        for line_num, line in enumerate(lines):
             original_line = line
             line_strip = line.strip()
             modified = False
 
-            # onboot auf 0 setzen
-            if re.match(r'^\s*onboot:\s*[01]', line_strip):
-                 if line_strip != "onboot: 0":
-                    new_line_content = "onboot: 0"
-                    line = new_line_content + "\n"
-                    print(f"   Setting '{color_text('onboot: 0', 'YELLOW')}'")
-                    modified = True
+            # Stop processing at first snapshot section
+            if line_strip.startswith('['):
+                print_warning(f"   Skipping snapshot section starting at line {line_num+1}")
+                processing_active_config = False
 
-            # name/hostname Präfix hinzufügen, falls nicht vorhanden
-            elif line_strip.startswith('name:') and not Path(line_strip.split(':', 1)[1].strip()).name.startswith(name_prefix):
+            if not processing_active_config or not line_strip or line_strip.startswith('#'):
+                modified_lines.append(line)
+                continue
+
+            # --- General Adjustments ---
+            if re.match(r'^\s*onboot:\s*[01]', line_strip) and line_strip != "onboot: 0":
+                new_line_content = "onboot: 0"
+                line = new_line_content + "\n"
+                print(f"   Setting '{color_text('onboot: 0', 'YELLOW')}'")
+                modified = True
+            elif name_prefix and line_strip.startswith('name:') and not line_strip.split(':', 1)[1].strip().startswith(name_prefix):
+                 # Use regex to ensure only the value part is prefixed
                  new_line_content = re.sub(r'(^\s*name:\s*)(.*)', rf'\1{name_prefix}\2', line.strip())
                  line = new_line_content + "\n"
                  print(f"   Adding '{color_text(name_prefix, 'YELLOW')}' prefix to name")
                  modified = True
-            elif line_strip.startswith('hostname:') and not Path(line_strip.split(':', 1)[1].strip()).name.startswith(name_prefix): # Gilt für LXC
+            elif name_prefix and instance_type == 'lxc' and line_strip.startswith('hostname:') and not line_strip.split(':', 1)[1].strip().startswith(name_prefix):
                  new_line_content = re.sub(r'(^\s*hostname:\s*)(.*)', rf'\1{name_prefix}\2', line.strip())
                  line = new_line_content + "\n"
                  print(f"   Adding '{color_text(name_prefix, 'YELLOW')}' prefix to hostname")
                  modified = True
-
-            # Netzwerkadapter standardmäßig deaktivieren (link_down=1)
             elif re.match(r'^\s*net\d+:', line_strip):
-                current_line_state = line
                 if 'link_down=1' not in line_strip:
-                    # Füge link_down=1 hinzu, behalte Kommentare bei
                     parts = line_strip.split('#', 1)
                     main_part = parts[0].rstrip()
                     comment_part = f" #{parts[1]}" if len(parts) > 1 else ""
-                    # Füge Komma hinzu, wenn nötig
-                    if main_part.endswith(','): main_part += "link_down=1"
-                    else: main_part += ",link_down=1"
-                    current_line_state = main_part + comment_part + "\n"
+                    # Add comma if needed before adding link_down
+                    if main_part.split(':')[-1].strip() and not main_part.endswith(','):
+                         main_part += ","
+                    main_part += "link_down=1"
+                    line = main_part + comment_part + "\n"
                     print(f"   Adding '{color_text('link_down=1', 'YELLOW')}' to network interface: {original_line.strip()}")
                     modified = True
-                # Update line only if modified
-                if modified: line = current_line_state
 
+            # --- Storage Adjustments (Dataset Mapping) ---
+            match = None
+            storage_key = None
+            current_storage_name = None
+            current_dataset_name = None
+            line_options_part = "" # Part after the dataset name (e.g., ,size=XX)
+
+            if instance_type == "vm":
+                match = storage_regex_vm.match(line_strip)
+                if match:
+                    key_base = match.group(1) # scsi, ide, etc.
+                    key_num = match.group(2)  # 0, 1, etc.
+                    storage_key = f"{key_base}{key_num}" # e.g., scsi0, efidisk0
+                    details_part = match.group(3).strip() # e.g., local-zfs:vm-100-disk-0,size=32G or file=/path/to/iso
+                    # Check if it uses PVE storage format (storage:volume)
+                    storage_match = re.match(r'([^:]+):([^,]+)(.*)', details_part)
+                    if storage_match:
+                         current_storage_name = storage_match.group(1).strip()
+                         current_dataset_name = storage_match.group(2).strip()
+                         line_options_part = storage_match.group(3).strip() # Includes leading comma if present
+
+            else: # LXC
+                match = storage_regex_lxc.match(line_strip)
+                if match:
+                    storage_key = match.group(1) # e.g., rootfs, mp0
+                    details_part = match.group(2).strip() # e.g., local-zfs:subvol-101-disk-0,size=8G,acl=1
+                    storage_match = re.match(r'([^:]+):([^,]+)(.*)', details_part)
+                    if storage_match:
+                        current_storage_name = storage_match.group(1).strip()
+                        current_dataset_name = storage_match.group(2).strip()
+                        line_options_part = storage_match.group(3).strip()
+
+            # If this is a storage line that needs mapping AND we have a map entry for it:
+            if storage_key and current_dataset_name and dataset_map and storage_key in dataset_map:
+                new_dataset_basename = dataset_map[storage_key]
+                old_storage_part = f"{current_storage_name}:{current_dataset_name}"
+                new_storage_part = f"{pve_storage_to_use}:{new_dataset_basename}"
+
+                # Reconstruct the line: key: new_storage_part + options
+                # Ensure options start with comma if they exist
+                if line_options_part and not line_options_part.startswith(','):
+                    line_options_part = ',' + line_options_part
+
+                newline = f"{storage_key}: {new_storage_part}{line_options_part}\n"
+
+                if newline != line:
+                    print(f"   Mapped storage {color_text(storage_key, 'BLUE')} -> {color_text(new_storage_part, 'GREEN')}")
+                    line = newline
+                    modified = True
+                else:
+                    # This might happen if the original line was already correct (e.g., during clone)
+                    # print_warning(f"   [DEBUG] Line seems unchanged after mapping attempt: {line.strip()}")
+                    pass
+
+
+            # Append the (potentially modified) line
+            if not line.endswith('\n'): line += '\n'
             modified_lines.append(line)
             if modified: changes_made = True
 
+
         if changes_made:
-            # Schreibe die geänderte Konfiguration zurück
+            # Write back the modified content
             with open(conf_path, 'w') as f_new:
                 f_new.writelines(modified_lines)
             print_success("   Configuration adjustments applied.")
         else:
-             print_info("   No standard adjustments needed or applicable.")
+             print_info("   No configuration adjustments needed or applied.")
 
     except FileNotFoundError:
-         print_error(f"\nError: Config file {conf_path} not found. Cannot apply adjustments.")
+         # Error should be handled before calling this function
+         print_error(f"Config file {conf_path} disappeared before adjustments could be written.", exit_code=1)
     except Exception as e:
         print_error(f"\nError adjusting config file {conf_path}: {e}")
         print_warning(f"Config file {conf_path} may not have been properly adjusted.")
 
 
-def main():
-    """Hauptfunktion des Skripts."""
-    print_info("=== Proxmox VM/LXC Clone Script (ZFS Linked/Full from Snapshot) ===")
-    print()
+def find_zfs_datasets(conf_path, pve_storage_name, zfs_pool_path):
+    """
+    Findet ZFS-Datasets, die in einer Konfigurationsdatei für ein bestimmtes Storage referenziert werden.
 
-    pv_available = is_tool('pv')
-    if not pv_available:
-        print_warning("Tool 'pv' (Pipe Viewer) not found in PATH.")
-        print_warning("Full clones will be created without a progress bar.")
-    else:
-        print_info("Tool 'pv' found, will be used for full clone progress.")
+    Args:
+        conf_path (Path): Path to the Proxmox config file.
+        pve_storage_name (str): The name of the PVE storage backend (e.g., 'local-zfs').
+        zfs_pool_path (str): The base path of the ZFS pool (e.g., 'rpool/data').
 
-    if not list_instances():
-        print_error("Exiting script as no instances were found.")
-        sys.exit(1)
-    print()
+    Returns:
+        tuple: (dict, str) where dict maps config keys to full dataset paths,
+               and str is 'vm' or 'lxc'.
+    """
+    storage_datasets = {} # {config_key: full_dataset_path}
+    instance_type = "vm" if 'qemu-server' in conf_path.parts else "lxc"
 
-    # --- Quell-ID Abfrage ---
-    while True:
-        src_id = input("Enter the source VM or LXC ID: ").strip()
-        if src_id.isdigit(): break
-        else: print_error("Invalid ID format.")
+    # Regex needs to match the specific PVE storage name provided
+    # It looks for lines like: key: storage:volume,... or key: volume,... (assuming default storage)
+    # Make sure pve_storage_name is properly escaped in case it contains special regex characters
+    escaped_pve_storage_name = re.escape(pve_storage_name)
+    storage_regex_vm = re.compile(rf'^(scsi|ide|sata|virtio|efidisk|tpmstate)(\d+):\s*(?:{escaped_pve_storage_name}:)?([^,\s]+)')
+    storage_regex_lxc = re.compile(rf'^(rootfs|mp\d+):\s*(?:{escaped_pve_storage_name}:)?([^,\s]+)')
 
-    # --- Instanztyp bestimmen ---
-    vm_conf = Path(f"/etc/pve/qemu-server/{src_id}.conf")
-    lxc_conf = Path(f"/etc/pve/lxc/{src_id}.conf")
-
-    if vm_conf.is_file():
-        clone_type_src = "vm"; pve_cmd = "qm"; conf_dir = vm_conf.parent; dataset_prefix = "vm-"
-        config_type = "VM"; src_conf_path = vm_conf
-    elif lxc_conf.is_file():
-        clone_type_src = "lxc"; pve_cmd = "pct"; conf_dir = lxc_conf.parent; dataset_prefix = "subvol-"
-        config_type = "LXC Container"; src_conf_path = lxc_conf
-    else:
-        print_error(f"Error: No VM or LXC with ID {src_id} found."); sys.exit(1)
-
-    src_instance_id, src_instance_name = get_instance_details(src_conf_path)
-    print_success(f"Selected source: ID {src_instance_id} ({config_type}: {src_instance_name})")
-
-    # --- Ziel-ID Abfrage ---
-    default_new_id = f"9{src_id}" # Vorschlag für neue ID
-    while True:
-        new_id = input(f"Enter the new {config_type} ID (blank for default={default_new_id}): ").strip()
-        if not new_id: new_id = default_new_id; print_warning(f"Using default ID: {new_id}")
-        if new_id.isdigit():
-            # Prüfe auf Kollisionen
-            new_conf_path_vm = Path("/etc/pve/qemu-server") / f"{new_id}.conf"
-            new_conf_path_lxc = Path("/etc/pve/lxc") / f"{new_id}.conf"
-            collision = False
-            if new_conf_path_vm.exists(): print_error(f"Config file for VM ID {new_id} exists!"); collision = True
-            if new_conf_path_lxc.exists(): print_error(f"Config file for LXC ID {new_id} exists!"); collision = True
-            # Prüfe auch auf potentielle ZFS-Dataset-Kollision (vereinfacht)
-            potential_new_ds_name = f"{dataset_prefix}{new_id}-disk-0" # Annahme für die erste Disk
-            if get_zfs_property(f"{DEFAULT_ZFS_POOL_PATH}/{potential_new_ds_name}", 'type'):
-                 print_error(f"Potential ZFS dataset for ID {new_id} seems to exist."); collision = True
-            if not collision: break
-        else: print_error("Invalid new ID format.")
-    new_conf_path = conf_dir / f"{new_id}.conf"
-
-    # --- Klonmodus Abfrage ---
-    while True:
-        clone_mode_input = input(f"Choose clone mode: [{color_text('linked', 'GREEN')}/full] (from snapshot, default: linked): ").strip().lower()
-        if not clone_mode_input or clone_mode_input == 'linked': clone_mode = 'linked'; break
-        elif clone_mode_input == 'full': clone_mode = 'full'; break
-        else: print_error("Invalid choice.")
-    print_info(f"Selected mode: {clone_mode.capitalize()} Clone")
-
-    # --- RAM-Check (nur für VMs) ---
-    if clone_type_src == "vm":
-        print_info("\nChecking host RAM usage...")
-        try:
-            # Gesamten Host-RAM ermitteln
-            free_output = run_command(['free', '-m'], capture_output=True)
-            mem_line = free_output.split('\n')[1]; total_ram_mb = int(mem_line.split()[1])
-
-            # RAM der Quell-VM ermitteln
-            qm_config_output = run_command([pve_cmd, 'config', src_id], capture_output=True, suppress_stderr=True)
-            src_vm_ram_mb = 512 # Defaultwert
-            match = re.search(r'^memory:\s*(\S+)', qm_config_output, re.MULTILINE)
-            if match: parsed_ram = parse_size_to_mb(match.group(1)); src_vm_ram_mb = parsed_ram if parsed_ram > 0 else 512
-            else: print_warning(f"No 'memory' setting for VM {src_id}, assuming {src_vm_ram_mb} MB.")
-
-            # RAM aller laufenden VMs summieren
-            qm_list_output = run_command([pve_cmd, 'list', '--full'], capture_output=True, suppress_stderr=True)
-            sum_running_ram_mb = 0
-            running_vm_lines = [line for line in qm_list_output.split('\n')[1:] if 'running' in line.split()]
-            header_line = qm_list_output.split('\n')[0]; headers = header_line.split()
-            try: mem_index = headers.index('maxmem') # Versuche maxmem Spalte zu finden
-            except ValueError: mem_index = -1 # Fallback, wenn Spalte nicht da ist
-
-            for line in running_vm_lines:
-                parts = line.split(); vmid = parts[0]; ram_mb = 512
-                if vmid.isdigit():
-                    # Versuche, RAM aus 'qm list --full' zu lesen (effizienter)
-                    if mem_index != -1 and len(parts) > mem_index:
-                         try: ram_bytes = int(parts[mem_index]); ram_mb = ram_bytes // (1024*1024) if ram_bytes > 0 else 512
-                         except ValueError: pass # Ignoriere, wenn Wert keine Zahl ist
-                    else:
-                        # Fallback: Lese RAM aus der individuellen VM-Konfig
-                        vm_config = run_command([pve_cmd, 'config', vmid], capture_output=True, suppress_stderr=True)
-                        match_ram = re.search(r'^memory:\s*(\S+)', vm_config, re.MULTILINE)
-                        if match_ram: parsed = parse_size_to_mb(match_ram.group(1)); ram_mb = parsed if parsed > 0 else 512
-                    sum_running_ram_mb += ram_mb
-
-            # Prognose und Warnung
-            threshold_mb = math.floor(total_ram_mb * RAM_THRESHOLD_PERCENT / 100)
-            prognostic_ram_mb = sum_running_ram_mb + src_vm_ram_mb
-            print(f"   Total host RAM:      {color_text(format_bytes(total_ram_mb*1024*1024), 'BLUE')}")
-            print(f"   RAM running VMs:   {color_text(format_bytes(sum_running_ram_mb*1024*1024), 'BLUE')}")
-            print(f"   Source VM RAM:       {color_text(format_bytes(src_vm_ram_mb*1024*1024), 'BLUE')}")
-            print(f"   Projected RAM:     {color_text(format_bytes(prognostic_ram_mb*1024*1024), 'BLUE')} (if clone starts)")
-            print(f"   {RAM_THRESHOLD_PERCENT}% Threshold:      {color_text(format_bytes(threshold_mb*1024*1024), 'BLUE')}")
-            if prognostic_ram_mb > threshold_mb:
-                 print_warning(f"\nWARNING: Starting clone might exceed {RAM_THRESHOLD_PERCENT}% RAM usage!")
-                 confirm = input(f"{color_text('Continue cloning? (y/N) ', 'RED')}{COLORS['NC']}").strip().lower()
-                 if confirm not in ['y', 'yes']: print_error("Cloning aborted."); sys.exit(1)
-            else: print_success("RAM check passed.")
-        except Exception as e: print_warning(f"\nCould not complete RAM check: {e}. Proceeding cautiously.")
-    else: print_info("\nSkipping RAM check for LXC containers.")
-
-    # --- ZFS Datasets finden ---
-    print_info(f"\nSearching for ZFS datasets in {src_conf_path} linked to '{DEFAULT_PVE_STORAGE}'...")
-    storage_datasets = {} # Speichert {config_key: full_dataset_path}
-    storage_regex_vm = re.compile(rf'^(scsi|ide|sata|virtio|efidisk|tpmstate)\d+:\s*[^#]*{DEFAULT_PVE_STORAGE}:([^,]+)')
-    storage_regex_lxc = re.compile(rf'^(rootfs|mp\d+):\s*[^#]*{DEFAULT_PVE_STORAGE}:([^,]+)')
+    print_info(f"Searching for ZFS datasets in {conf_path} linked to storage '{pve_storage_name}' (Pool: {zfs_pool_path})...")
     try:
-        with open(src_conf_path, 'r') as f:
+        with open(conf_path, 'r') as f:
             processing_current_config = True
-            for line in f:
+            for line_num, line in enumerate(f):
                 line = line.strip()
-                if re.match(r'^\[.*\]$', line): # Prüfen auf Snapshot-Header
+                # Stop at snapshot sections
+                if line.startswith('['):
                     processing_current_config = False
-                    continue
-                if not processing_current_config: # Überspringe Zeilen in Snapshot-Sektionen
-                    continue
+                if not processing_current_config: continue
 
-                if not line or line.startswith('#') or line.startswith('parent:'): continue # Ignoriere Kommentare, Leerzeilen, Parent
+                if not line or line.startswith('#') or line.startswith('parent:'): continue
 
                 match = None; key = ""; dataset_name_part = ""
-                if clone_type_src == "vm":
+                if instance_type == "vm":
                     match = storage_regex_vm.match(line)
-                    if match: key = match.group(1) + line[len(match.group(1)):line.find(':')]; dataset_name_part = match.group(2).strip()
+                    if match:
+                        key_base = match.group(1) # scsi, ide, etc.
+                        key_num = match.group(2)  # 0, 1, etc.
+                        key = f"{key_base}{key_num}" # e.g., scsi0, efidisk0
+                        # Group 3 captures the volume name, possibly including the storage prefix if it wasn't the one we searched for
+                        potential_volume = match.group(3).split(',')[0].strip()
+                        # If it contains ':' OR if the line explicitly matched the target storage name, use it
+                        # This logic needs care: if the line was `scsi0: other-storage:vm-100-disk-0`, group 3 is `other-storage:vm-100-disk-0`
+                        # If the line was `scsi0: target-storage:vm-100-disk-0`, group 3 is `vm-100-disk-0` (because the prefix was optionally matched)
+                        # If the line was `scsi0: vm-100-disk-0`, group 3 is `vm-100-disk-0`
+                        line_matches_target_storage = f"{escaped_pve_storage_name}:" in match.group(0)
+                        if ':' not in potential_volume or line_matches_target_storage:
+                            dataset_name_part = potential_volume
                 else: # LXC
                     match = storage_regex_lxc.match(line)
-                    if match: key = match.group(1); dataset_name_part = match.group(2).split(',')[0].strip() # Nimm nur den Dataset-Namen vor dem Komma
+                    if match:
+                        key = match.group(1) # 'rootfs' or 'mpX'
+                        potential_volume = match.group(2).split(',')[0].strip()
+                        line_matches_target_storage = f"{escaped_pve_storage_name}:" in match.group(0)
+                        if ':' not in potential_volume or line_matches_target_storage:
+                             dataset_name_part = potential_volume
 
                 if key and dataset_name_part:
-                    # Bilde den vollständigen Dataset-Pfad
-                    if '/' in dataset_name_part: # Wenn der Pfad schon relativ vollständig ist
+                    # Build the full dataset path
+                    # Assume dataset_name_part is relative to zfs_pool_path
+                    # Handle cases where it might already include the pool path (less likely for standard PVE configs)
+                    if dataset_name_part.startswith(zfs_pool_path + '/'):
                         full_dataset_path = dataset_name_part
-                    else: # Füge Standard-Poolpfad hinzu
-                        full_dataset_path = f"{DEFAULT_ZFS_POOL_PATH}/{dataset_name_part}"
+                    elif '/' in dataset_name_part and not dataset_name_part.startswith('/'):
+                        # Looks like a relative path but contains slashes - might be complex pool layout
+                        full_dataset_path = f"{zfs_pool_path.rstrip('/')}/{dataset_name_part}"
+                        print_warning(f"   (Line {line_num+1}) Interpreting relative path '{dataset_name_part}' as '{full_dataset_path}' under pool '{zfs_pool_path}'")
+                    else: # Simple name, prepend pool path
+                        full_dataset_path = f"{zfs_pool_path.rstrip('/')}/{dataset_name_part}"
 
-                    # Überprüfe, ob das Dataset existiert
-                    if run_command(['zfs', 'list', '-H', full_dataset_path], check=False, capture_output=True, suppress_stderr=True):
+                    # Check if the dataset actually exists using zfs get
+                    if get_zfs_property(full_dataset_path, 'type'):
                          storage_datasets[key] = full_dataset_path
                          print(f"   Found: {color_text(key, 'BLUE')} -> {full_dataset_path}")
-                    else: print_warning(f"   Dataset for {color_text(key, 'BLUE')} ('{full_dataset_path}') not found. Skipping.")
-    except Exception as e: print_error(f"Error reading {src_conf_path}: {e}"); sys.exit(1)
+                    else:
+                        print_warning(f"   Dataset for {color_text(key, 'BLUE')} ('{full_dataset_path}') not found via 'zfs get type'. Skipping.")
 
-    if not storage_datasets: print_error(f"No ZFS datasets found for '{DEFAULT_PVE_STORAGE}' in {src_conf_path}."); sys.exit(1)
+    except FileNotFoundError:
+        print_error(f"Configuration file {conf_path} not found.", exit_code=1)
+    except Exception as e:
+        print_error(f"Error reading {conf_path}: {e}", exit_code=1)
 
-    # --- Referenz-Dataset für Snapshots bestimmen ---
-    ref_key = ""; ref_dataset = ""; min_disk_num = 99999; efi_key = ""; efi_dataset = ""
-    if clone_type_src == 'lxc' and 'rootfs' in storage_datasets: ref_key = 'rootfs'; ref_dataset = storage_datasets[ref_key]
-    else: # Für VMs, suche nach der Disk mit der niedrigsten Nummer (oft disk-0 oder disk-1)
-        disk_num_regex = re.compile(r'.*[/-](disk|subvol)-(\d+)$') # Sucht nach -disk-N oder -subvol-N am Ende
+    if not storage_datasets:
+        print_warning(f"No existing ZFS datasets found for storage '{pve_storage_name}' (Pool: '{zfs_pool_path}') in {conf_path}.")
+
+    return storage_datasets, instance_type
+
+def select_reference_dataset(storage_datasets, instance_type):
+    """Bestimmt das Referenz-Dataset für Snapshot-Listen basierend auf Konventionen."""
+    if not storage_datasets:
+        print_error("Cannot select reference dataset: No datasets provided.")
+        return None, None
+
+    ref_key = None; ref_dataset = None;
+
+    if instance_type == 'lxc':
+        if 'rootfs' in storage_datasets:
+            ref_key = 'rootfs'
+        else:
+            # Find the mountpoint with the lowest index (mp0, mp1, ...)
+            mp_keys = sorted([k for k in storage_datasets if k.startswith('mp')], key=lambda x: int(x[2:]))
+            if mp_keys: ref_key = mp_keys[0]
+            else: # Fallback to the first key alphabetically if no rootfs or mpX found
+                sorted_keys = sorted(storage_datasets.keys())
+                if sorted_keys: ref_key = sorted_keys[0]
+
+            if ref_key: print_warning(f"LXC 'rootfs' not found or not on ZFS, using '{ref_key}' as reference.")
+            else: print_error("LXC has no 'rootfs' or 'mpX' datasets on the specified ZFS storage."); return None, None
+        ref_dataset = storage_datasets[ref_key]
+
+    else: # VM
+        # Prioritize disks with numbers (scsi0, virtio1, etc.), lowest number first
+        disk_num_regex = re.compile(r'(scsi|ide|sata|virtio)(\d+)$')
+        numbered_disks = {} # {disk_num: {'key': key, 'dataset': dataset}}
+        efi_key = None; efi_dataset = None
+        tpm_key = None; tpm_dataset = None
+
         for key, dataset in storage_datasets.items():
-            match = disk_num_regex.search(Path(dataset).name)
-            if match:
-                disk_num = int(match.group(2))
-                if disk_num < min_disk_num: min_disk_num = disk_num; ref_key = key; ref_dataset = dataset
-            # Merke dir EFI-Disk als Fallback
-            elif clone_type_src == 'vm' and key.startswith('efidisk') and not efi_key: efi_key = key; efi_dataset = dataset
-            # Fallback, wenn nur ein Dataset gefunden wurde
-            elif len(storage_datasets) == 1: ref_key = key; ref_dataset = dataset; break
-        # Wähle Referenz: Niedrigste Disk > EFI > Erstes gefundenes
-        if not ref_key and efi_key: ref_key = efi_key; ref_dataset = efi_dataset; print_warning(f"\nUsing EFI disk as reference: {ref_key} ({ref_dataset})")
-        elif not ref_key and storage_datasets: first_key = sorted(storage_datasets.keys())[0]; ref_key = first_key; ref_dataset = storage_datasets[first_key]; print_warning(f"\nUsing first dataset as reference: {ref_key} ({ref_dataset})")
-        elif not ref_key: print_error("\nCannot determine reference dataset."); sys.exit(1)
+             match = disk_num_regex.match(key)
+             if match:
+                 disk_num = int(match.group(2))
+                 numbered_disks[disk_num] = {'key': key, 'dataset': dataset}
+             elif key.startswith('efidisk') and not efi_key: # Track first EFI disk
+                 efi_key = key; efi_dataset = dataset
+             elif key.startswith('tpmstate') and not tpm_key: # Track first TPM state
+                 tpm_key = key; tpm_dataset = dataset
 
-    # --- Snapshot auswählen ---
-    print_info(f"\nUsing reference storage for snapshot listing: {color_text(ref_key, 'BLUE')} ({color_text(ref_dataset,'CYAN')})")
+        if numbered_disks:
+            min_disk_num = min(numbered_disks.keys())
+            ref_key = numbered_disks[min_disk_num]['key']
+            ref_dataset = numbered_disks[min_disk_num]['dataset']
+        elif efi_key: # Fallback to EFI disk if no numbered disks found
+            ref_key = efi_key; ref_dataset = efi_dataset
+            print_warning(f"No standard numbered disk found, using EFI disk '{ref_key}' as reference.")
+        elif tpm_key: # Fallback to TPM state disk if no EFI disk found
+            ref_key = tpm_key; ref_dataset = tpm_dataset
+            print_warning(f"No standard numbered disk or EFI disk found, using TPM state disk '{ref_key}' as reference.")
+        else: # Final fallback to the first dataset found alphabetically
+            sorted_keys = sorted(storage_datasets.keys())
+            if sorted_keys:
+                ref_key = sorted_keys[0]
+                ref_dataset = storage_datasets[ref_key]
+                print_warning(f"No standard numbered disk, EFI disk, or TPM state disk found, using first dataset '{ref_key}' as reference.")
+            else: # Should be caught earlier, but defensive check
+                print_error("No suitable reference dataset could be determined.")
+                return None, None
+
+    print_info(f"Using reference dataset for snapshot operations: {color_text(ref_key, 'BLUE')} ({color_text(ref_dataset,'CYAN')})")
+    return ref_key, ref_dataset
+
+
+def select_snapshot(ref_dataset):
+    """Lässt den Benutzer einen Snapshot aus einer Liste auswählen."""
     snapshots = list_snapshots(ref_dataset)
-    if not snapshots: print_error(f"No snapshots found for {ref_dataset}."); sys.exit(1)
+    if not snapshots:
+        print_error(f"No snapshots found for reference dataset {ref_dataset}.", exit_code=1)
 
-    print("Available snapshots:")
+    print("\nAvailable snapshots (newest first):")
+    # Sort by timestamp descending (newest first) for display
+    snapshots.sort(key=lambda x: x['creation_timestamp'], reverse=True)
     for i, snap in enumerate(snapshots):
         snap_suffix = snap['name'].split('@', 1)[1]
         creation_dt = datetime.fromtimestamp(snap['creation_timestamp']) if snap['creation_timestamp'] else None
@@ -588,211 +806,973 @@ def main():
 
     while True:
         try:
-            idx = int(input("Enter the index of the snapshot to clone: ").strip())
+            idx_input = input("Enter the index of the snapshot to use: ").strip()
+            if not idx_input:
+                 print_error("No index entered. Please select a snapshot.")
+                 continue
+            idx = int(idx_input)
             if 0 <= idx < len(snapshots):
                 selected_snapshot_info = snapshots[idx]
-                snap_suffix = selected_snapshot_info['name'].split('@', 1)[1] # Extrahiere nur den Namen nach dem '@'
-                print_success(f"Selected snapshot suffix: {snap_suffix}"); break
-            else: print_error("Index out of range.")
-        except ValueError: print_error("Invalid input.")
+                selected_snapshot_full_name = selected_snapshot_info['name']
+                # Extract the suffix part (after '@')
+                snap_suffix = selected_snapshot_full_name.split('@', 1)[1]
+                print_success(f"Selected snapshot suffix: {snap_suffix}")
+                # Return the full name of the selected snapshot AND its suffix
+                return selected_snapshot_full_name, snap_suffix
+            else: print_error(f"Index out of range (must be 0 to {len(snapshots)-1}).")
+        except ValueError: print_error("Invalid input. Please enter a number.")
 
-    # --- ZFS Klon-Operationen ---
+
+def generate_new_dataset_name(old_dataset_path, old_id, new_id, target_zfs_pool_path):
+    """
+    Generiert einen neuen Dataset-Namen für Klonen/Wiederherstellen.
+    Versucht, die alte ID im Namen durch die neue ID zu ersetzen.
+    """
+    old_dataset_name = Path(old_dataset_path).name
+    new_dataset_name = old_dataset_name
+
+    # Try to replace the old ID with the new ID using common delimiters
+    # Prioritize replacing `-old_id-` or `_old_id_` etc.
+    patterns_to_try = [
+        (rf"(-{old_id}-)", f"-{new_id}-"),  # -100- -> -9100-
+        (rf"(-{old_id}$)", f"-{new_id}"),   # -100  -> -9100 (at end)
+        (rf"(^{old_id}-)", f"{new_id}-"),   # 100-  -> 9100- (at start)
+        (rf"(_-_{old_id}_-_)", f"_-_{new_id}_-_"), # _-_100_-_ -> _-_9100_-_ (more specific?)
+        (rf"({old_id})", f"{new_id}"),      # 100 -> 9100 (fallback, less specific)
+    ]
+    replaced = False
+    for pattern, replacement in patterns_to_try:
+        temp_name, num_subs = re.subn(pattern, replacement, old_dataset_name, count=1)
+        if num_subs > 0:
+            new_dataset_name = temp_name
+            replaced = True
+            break # Stop after first successful replacement
+
+    if not replaced:
+        # Final fallback if no pattern matched: prepend new ID? Or append? Append seems safer.
+        new_dataset_name = f"{old_dataset_name}_newid_{new_id}"
+        print_warning(f"Could not reliably replace ID '{old_id}' in '{old_dataset_name}'. Using fallback name: '{new_dataset_name}'")
+
+    # Ensure it's joined correctly with the target pool path
+    target_pool_base = target_zfs_pool_path.rstrip('/')
+    return f"{target_pool_base}/{new_dataset_name}"
+
+
+# --- Mode Functions ---
+
+def do_clone(args):
+    """Führt den Klonvorgang durch."""
+    print_info("=== Running Clone Mode ===")
+    src_id = args.source_id
+    new_id = args.new_id
+    clone_mode = args.clone_mode
+    # Use arguments passed, falling back to defaults if not provided
+    target_zfs_pool_path = args.target_zfs_pool_path
+    target_pve_storage = args.target_pve_storage
+
+    # --- Find Source Instance ---
+    src_conf_path, src_instance_type = find_instance_config(src_id)
+    if not src_conf_path:
+        print_error(f"Error: No VM or LXC with ID {src_id} found.", exit_code=1)
+
+    src_instance_id_str, src_instance_name, config_type_str = get_instance_details(src_conf_path)
+    print_success(f"Selected source: ID {src_instance_id_str} ({config_type_str}: {src_instance_name})")
+    pve_cmd = "qm" if src_instance_type == "vm" else "pct"
+    conf_dir = src_conf_path.parent
+
+    # --- Determine and Validate Target ID ---
+    if not new_id:
+        default_new_id = f"9{src_id}" # Simple default prefix
+        try:
+            new_id_input = input(f"Enter the new {config_type_str} ID (blank for default={default_new_id}): ").strip()
+            new_id = new_id_input or default_new_id
+            if not new_id.isdigit() or int(new_id) <= 0:
+                 print_error(f"Invalid new ID '{new_id}'. Must be a positive integer.", exit_code=1)
+            if new_id == default_new_id and not new_id_input:
+                 print_warning(f"Using default ID: {new_id}")
+        except ValueError:
+             print_error(f"Invalid input for new ID.", exit_code=1)
+        except EOFError:
+            print_error("\nNon-interactive mode: New ID must be provided as an argument.", exit_code=1)
+
+
+    # Check for config file collision
+    new_conf_path_vm = Path("/etc/pve/qemu-server") / f"{new_id}.conf"
+    new_conf_path_lxc = Path("/etc/pve/lxc") / f"{new_id}.conf"
+    collision = False
+    if new_conf_path_vm.exists(): print_error(f"Config file for VM ID {new_id} ({new_conf_path_vm}) already exists!"); collision = True
+    if new_conf_path_lxc.exists(): print_error(f"Config file for LXC ID {new_id} ({new_conf_path_lxc}) already exists!"); collision = True
+
+    if collision: sys.exit(1)
+    # Determine the correct target path based on source type
+    new_conf_path = new_conf_path_vm if src_instance_type == "vm" else new_conf_path_lxc
+
+    # --- Clone Mode Info ---
+    print_info(f"Selected mode: {clone_mode.capitalize()} Clone")
+
+    # --- RAM Check (VMs only) ---
+    if src_instance_type == "vm":
+        perform_ram_check(pve_cmd, src_id)
+    else: print_info("\nSkipping RAM check for LXC containers.")
+
+    # --- Find ZFS Datasets ---
+    # Use the *target* PVE storage and *target* ZFS pool path to find relevant source datasets
+    # This assumes the source datasets are structured similarly or under the same storage/pool as the target
+    storage_datasets, _ = find_zfs_datasets(src_conf_path, target_pve_storage, target_zfs_pool_path)
+    if not storage_datasets:
+        print_error(f"No ZFS datasets found for storage '{target_pve_storage}' (Pool: '{target_zfs_pool_path}') in {src_conf_path}. Cannot clone.", exit_code=1)
+
+    # --- Select Reference Dataset & Snapshot ---
+    ref_key, ref_dataset = select_reference_dataset(storage_datasets, src_instance_type)
+    if not ref_key: sys.exit(1) # Error already printed by select_reference_dataset
+
+    selected_snapshot_full_name, snap_suffix = select_snapshot(ref_dataset)
+
+    # --- ZFS Clone Operations ---
     print_info(f"\n--- Starting ZFS {clone_mode.capitalize()} Clone Operations ---")
-    cloned_keys = [] # Speichert die Schlüssel der erfolgreich geklonten Datasets
-    all_ops_successful = True
-    # Pattern zum Zerlegen des Dataset-Namens (Pool/Präfix/ID/Suffix)
-    dataset_name_pattern = re.compile(rf"^(.*\/)({dataset_prefix})(\d+)(-.*)$")
+    print_info(f"Target ZFS Pool Path: {target_zfs_pool_path}")
+    print_info(f"Target PVE Storage: {target_pve_storage}")
 
+    cloned_datasets_map = {} # {key: new_dataset_basename}
+    all_ops_successful = True
+    pv_available = is_tool('pv')
+    cleanup_list = [] # Keep track of created datasets for potential rollback
+
+    # Check for potential target dataset collisions *before* starting operations
+    print_info("Checking for potential target dataset collisions...")
+    potential_targets = {}
+    collision_found = False
     for key, dataset in storage_datasets.items():
-        target_snapshot = f"{dataset}@{snap_suffix}" # Baue den vollen Snapshot-Namen zusammen
+        # Use the target ZFS pool path provided by argument/default
+        new_dataset = generate_new_dataset_name(dataset, src_id, new_id, target_zfs_pool_path)
+        potential_targets[key] = new_dataset
+        if get_zfs_property(new_dataset, 'type'):
+            print_error(f"Target dataset '{new_dataset}' for key '{key}' already exists.")
+            collision_found = True
+    if collision_found:
+        print_error("Aborting due to target dataset collision(s).", exit_code=1)
+    print_success("No target dataset collisions found.")
+
+
+    # --- Execute Clones ---
+    for key, dataset in storage_datasets.items():
+        # Construct the source snapshot name for this specific dataset using the chosen suffix
+        target_snapshot = f"{dataset}@{snap_suffix}"
+        new_dataset = potential_targets[key] # Use pre-calculated name
+
         print(f"\n {color_text(f'Processing {key}:', 'CYAN')}")
         print(f"    Source dataset:  {color_text(dataset, 'BLUE')}")
         print(f"    Source snapshot: {color_text(target_snapshot, 'BLUE')}")
-
-        # Prüfe, ob der spezifische Snapshot für DIESES Dataset existiert
-        if not get_zfs_property(target_snapshot, 'type'):
-             print_warning(f"    [WARN] Snapshot '{target_snapshot}' does not exist for this dataset. Skipping.")
-             continue # Gehe zum nächsten Dataset
-
-        # Generiere den neuen Dataset-Namen
-        match = dataset_name_pattern.match(dataset)
-        if match:
-            pool_base = match.group(1); suffix = match.group(4)
-            new_dataset = f"{pool_base}{dataset_prefix}{new_id}{suffix}"
-        else:
-            # Fallback: Ersetze die ID im Basisnamen (weniger robust)
-            old_base = Path(dataset).name; new_base = old_base.replace(f"{src_id}", f"{new_id}", 1)
-            if new_base != old_base: new_dataset = str(Path(dataset).parent / new_base); print_warning("    Using fallback name generation.")
-            else: print_error(f"    [ERROR] Cannot parse dataset name '{dataset}'. Skipping."); all_ops_successful = False; continue
-
         print(f"    Target dataset:  {color_text(new_dataset, 'GREEN')}")
 
-        # Prüfe, ob das Ziel-Dataset bereits existiert
-        if get_zfs_property(new_dataset, 'type'):
-            print_warning(f"    Target dataset '{new_dataset}' already exists. Skipping operation.")
-            # Betrachte es als "geklont" für die Config-Erstellung, da es existiert
-            cloned_keys.append(key)
-            continue
+        # Check snapshot existence for THIS dataset
+        if not get_zfs_property(target_snapshot, 'type'):
+             print_warning(f"    [WARN] Snapshot '{target_snapshot}' does not exist for this specific dataset. Skipping.")
+             continue # Skip this disk
 
         op_success = False
         if clone_mode == 'linked':
             clone_cmd = ['zfs', 'clone', target_snapshot, new_dataset]
             print(f"    Executing linked clone: {' '.join(clone_cmd)}")
             try:
+                # Run without capturing output, let zfs clone show messages/errors
                 run_command(clone_cmd, check=True, capture_output=False, error_msg="ZFS clone failed")
                 print_success("    Linked clone successful.")
                 op_success = True
-            except SystemExit: # run_command löst bei Fehler sys.exit aus
+            except SystemExit:
+                # Error message printed by run_command
                 print_error("    Error during 'zfs clone'.")
                 all_ops_successful = False
-        else: # Full clone
+                # Do not proceed further if a clone fails
+                break
+
+        else: # Full clone (send/receive)
             print(f"    Preparing full clone (send/receive)...")
             estimated_size_bytes = get_snapshot_size_estimate(target_snapshot)
-            size_str = f"~{format_bytes(estimated_size_bytes)}" if estimated_size_bytes else "Unknown size"
+            size_str = f"~{format_bytes(estimated_size_bytes)}" if estimated_size_bytes is not None else "Unknown size"
             print(f"    Estimated size: {size_str}")
 
-            # Baue die Pipeline-Befehle
             send_cmd = ['zfs', 'send', target_snapshot]
-            recv_cmd = ['zfs', 'receive', '-o', 'readonly=off', new_dataset] # Stelle sicher, dass Klon beschreibbar ist
-            pipeline_cmds = []
-            pipeline_names = []
-
-            pipeline_cmds.append(send_cmd)
-            pipeline_names.append("zfs send")
+            recv_cmd = ['zfs', 'receive', '-o', 'readonly=off', new_dataset] # Ensure cloned dataset is writable
+            pipeline_cmds = [send_cmd]
+            pipeline_names = ["zfs send"]
+            pv_opts = None
 
             if pv_available:
-                pv_cmd = ['pv']
-                # Füge Größe hinzu, wenn bekannt
-                if estimated_size_bytes:
-                    pv_cmd.extend(['-s', str(estimated_size_bytes)])
-                pv_cmd.extend(['-p', '-t', '-e', '-r', '-b', '-N', f'{Path(new_dataset).name}']) # Optionen für Fortschrittsanzeige
-                pipeline_cmds.append(pv_cmd)
+                pv_cmd_base = ['pv']
+                # Keep -p (percent), -t (time), -r (rate), -b (bytes)
+                # -N gives a name to the progress bar
+                pv_opts = ['-p', '-t', '-r', '-b', '-N', f'clone-{key}']
+                if estimated_size_bytes: pv_opts.extend(['-s', str(estimated_size_bytes)])
+                pipeline_cmds.append(pv_cmd_base)
                 pipeline_names.append("pv")
             else:
-                 print_warning("    Executing full clone without progress bar ('pv' not found).")
+                print_warning("    Executing full clone without progress bar ('pv' not found).")
 
             pipeline_cmds.append(recv_cmd)
             pipeline_names.append("zfs receive")
 
             print(f"    Executing pipeline: {' | '.join([' '.join(c) for c in pipeline_cmds])}")
-            if run_pipeline(pipeline_cmds, pipeline_names):
+            pipeline_successful = run_pipeline(pipeline_cmds, pipeline_names, pv_options=pv_opts, output_file=None)
+
+            if pipeline_successful:
                  print_success("    Full clone (send/receive) successful.")
                  op_success = True
             else:
+                 # Error message printed by run_pipeline
                  print_error("    Error during 'zfs send/receive' pipeline.")
                  all_ops_successful = False
-                 # Versuche, ein möglicherweise unvollständiges Ziel-Dataset zu entfernen
-                 if get_zfs_property(new_dataset, 'type'):
-                     print_warning(f"    Attempting to destroy potentially incomplete target dataset: {new_dataset}")
-                     run_command(['zfs', 'destroy', new_dataset], check=False, suppress_stderr=True)
+                 # Do not proceed further if a clone fails
+                 break
 
         if op_success:
-            cloned_keys.append(key) # Füge den Key zur Liste der erfolgreich geklonten hinzu
+            cloned_datasets_map[key] = Path(new_dataset).name # Store basename for config adjustment
+            cleanup_list.append(new_dataset) # Add to cleanup list in case config fails later
         else:
-             # Fehler wurde bereits gemeldet, all_ops_successful ist False
-             pass # Gehe zum nächsten Dataset
+             # Error already printed, loop broken if necessary
+             pass
 
-    # --- Nachbereitung der ZFS-Operationen ---
+    # --- Post-ZFS Operations ---
     if not all_ops_successful:
-         print_error(f"\nOne or more ZFS {clone_mode} clone operations failed. Please review errors above.")
-         if not cloned_keys:
-             print_error("No datasets were successfully cloned/created. Aborting.")
-             sys.exit(1)
-         else:
-              # Fahre fort, wenn *einige* Datasets erfolgreich waren
-              print_warning("Attempting to create configuration for successfully cloned/created datasets...")
+         print_error(f"\nOne or more ZFS {clone_mode} clone operations failed. Attempting cleanup...", exit_code=1)
+         # Attempt to destroy datasets created so far
+         for ds_path in reversed(cleanup_list): # Destroy in reverse order of creation
+             print_warning(f"    Destroying partially created dataset: {ds_path}")
+             run_command(['zfs', 'destroy', '-r', ds_path], check=False, capture_output=False, suppress_stderr=True)
+         sys.exit(1)
 
-    if not cloned_keys: # Prüfe nochmal explizit, ob *irgendetwas* geklont wurde
-        print_error("\nNo datasets were successfully processed or created. Cannot create config.")
+    if not cloned_datasets_map:
+        print_error("\nNo datasets were successfully processed or created. Cannot create config.", exit_code=1)
+
+    # --- Create New Configuration File ---
+    print_info(f"\nCreating new {config_type_str} configuration: {color_text(str(new_conf_path), 'BLUE')}")
+    config_created_successfully = False
+    try:
+        shutil.copy2(src_conf_path, new_conf_path)
+        print_success(f"Copied base configuration from {src_conf_path} to {new_conf_path}.")
+
+        adjust_config_file(
+            conf_path=new_conf_path,
+            instance_type=src_instance_type,
+            new_id=new_id, # Pass new_id for potential future use in adjustments
+            target_pve_storage=target_pve_storage, # Pass the target storage name
+            dataset_map=cloned_datasets_map,
+            name_prefix="clone-"
+        )
+        config_created_successfully = True
+
+    except Exception as e:
+        print_error(f"Error processing config file {new_conf_path}: {e}")
+        # Attempt cleanup of config file AND cloned datasets
+        if new_conf_path.exists():
+            print_warning(f"Removing potentially incomplete config file: {new_conf_path}")
+            try: new_conf_path.unlink()
+            except OSError as del_err: print_warning(f"Could not remove config file: {del_err}")
+
+        print_warning("Attempting to clean up cloned ZFS datasets due to config error...")
+        for ds_path in reversed(cleanup_list):
+             print_warning(f"    Destroying cloned dataset: {ds_path}")
+             run_command(['zfs', 'destroy', '-r', ds_path], check=False, capture_output=False, suppress_stderr=True)
         sys.exit(1)
 
-    # --- Neue Konfigurationsdatei erstellen ---
-    print_info(f"\nCreating new {config_type} configuration: {color_text(str(new_conf_path), 'BLUE')}")
-    new_config_lines = []
-    try:
-        with open(src_conf_path, 'r') as f_src: config_content = f_src.readlines()
 
-        processing_current_config = True
-        for line in config_content:
-            line_strip = line.strip()
-
-            if re.match(r'^\[.*\]$', line_strip): # Prüfen auf Snapshot-Header
-                processing_current_config = False
-                continue # Überspringe Header und folgende Zeilen
-            if not processing_current_config: # Ignoriere Zeilen in Snapshot-Sektionen
-                continue
-
-            # Ignoriere Leerzeilen, Kommentare, parent, snapdir etc. für die neue Konfig
-            # parent/snapdir sind spezifisch für Snapshots/Backups, nicht für den Klon
-            if not line_strip or line_strip.startswith('#') or line_strip.startswith(('parent:', 'snapdir:')):
-                new_config_lines.append(line); continue # Behalte Kommentare/Leerzeilen bei, ignoriere parent/snapdir
-
-            # Logik zur Verarbeitung von Storage-Zeilen (wie zuvor)
-            current_key = ""; is_storage_line = False; original_dataset_basename = ""
-            match_vm = storage_regex_vm.match(line_strip)
-            match_lxc = storage_regex_lxc.match(line_strip)
-
-            # Bestimme, ob es eine Storage-Zeile ist und ob sie zu den geklonten gehört
-            if clone_type_src == "vm" and match_vm:
-                key_part = match_vm.group(1) + line_strip[len(match_vm.group(1)):line_strip.find(':')]
-                if key_part in storage_datasets: current_key = key_part; is_storage_line = True; original_dataset_basename = Path(storage_datasets[current_key]).name
-            elif clone_type_src == "lxc" and match_lxc:
-                key_part = match_lxc.group(1)
-                if key_part in storage_datasets: current_key = key_part; is_storage_line = True; original_dataset_basename = Path(storage_datasets[current_key]).name
-
-            # Ersetze den Dataset-Pfad, wenn es eine geklonte Storage-Zeile ist
-            if is_storage_line and current_key in cloned_keys:
-                match_base = dataset_name_pattern.match(storage_datasets[current_key])
-                if match_base:
-                    pool_base = match_base.group(1); suffix = match_base.group(4)
-                    new_dataset_basename = f"{dataset_prefix}{new_id}{suffix}"
-                    # Ersetze den alten Dataset-Basisnamen durch den neuen
-                    # Stelle sicher, dass der Storage-Typ (z.B. local-zfs:) erhalten bleibt
-                    old_part = f"{DEFAULT_PVE_STORAGE}:{original_dataset_basename}"
-                    new_part = f"{DEFAULT_PVE_STORAGE}:{new_dataset_basename}"
-                    newline = line.replace(old_part, new_part, 1) # Ersetze nur das erste Vorkommen
-                    if newline == line: print_warning(f"   [WARN] Failed replace in line: {line.strip()}"); new_config_lines.append(line)
-                    else: print(f"   Updated storage line for {color_text(current_key, 'BLUE')}"); new_config_lines.append(newline)
-                else: print_warning(f"   [WARN] Cannot parse base name for {current_key}. Keeping original."); new_config_lines.append(line)
-            else:
-                # Behalte alle anderen Zeilen (z.B. cores, memory, net0 etc.) unverändert bei
-                new_config_lines.append(line)
-
-        # Schreibe die neue Konfigurationsdatei
-        with open(new_conf_path, 'w') as f_new: f_new.writelines(new_config_lines)
-        print_success(f"Configuration file {new_conf_path} created.")
-    except Exception as e: print_error(f"Error creating config {new_conf_path}: {e}"); sys.exit(1)
-
-    # --- Standardanpassungen an der neuen Konfig anwenden ---
-    adjust_config_file(new_conf_path, clone_type_src)
-
-    # --- Abschließende Meldung ---
+    # --- Final Message ---
     print(f"\n{color_text('--- Clone Process Finished ---', 'GREEN')}")
-    final_message = f"New {config_type} with ID {color_text(new_id, 'BLUE')} created as a {color_text(clone_mode + ' clone', 'YELLOW')} "
+    final_message = f"New {config_type_str} with ID {color_text(new_id, 'BLUE')} created as a {color_text(clone_mode + ' clone', 'YELLOW')} "
     final_message += f"from snapshot '{color_text(snap_suffix, 'CYAN')}' of {src_id}."
     print(final_message)
-    if not all_ops_successful: print_warning("Note: Some ZFS operations may have failed. Review logs carefully.")
+    print(f"Target ZFS Pool Path: {color_text(target_zfs_pool_path, 'BLUE')}")
+    print(f"Target PVE Storage: {color_text(target_pve_storage, 'BLUE')}")
     print(f"{color_text('Review the configuration:', 'YELLOW')} {color_text(str(new_conf_path), 'BLUE')}")
     print(color_text("Important checks: Network settings (IP/MAC), Hostname/Name, Resources, CD-ROMs (VMs), link_down=1 on NICs.", 'YELLOW'))
+
+
+def do_export(args):
+    """Führt den Exportvorgang durch."""
+    print_info("=== Running Export Mode ===")
+    src_id = args.source_id
+    parent_export_dir = Path(args.export_dir)
+    # Use specific source paths for export
+    source_zfs_pool_path = args.source_zfs_pool_path
+    source_pve_storage = args.source_pve_storage
+
+    # --- Define and Create Export Directory ---
+    # Create a subdirectory named after the source ID
+    export_dir = parent_export_dir / src_id
+    print_info(f"Target export directory: {color_text(str(export_dir), 'BLUE')}")
+    try:
+        export_dir.mkdir(parents=True, exist_ok=False) # exist_ok=False to prevent overwriting previous exports
+        # Test writability
+        with tempfile.NamedTemporaryFile(prefix='write_test_', dir=export_dir, delete=True): pass
+    except FileExistsError:
+        print_error(f"Export directory '{export_dir}' already exists. Please remove it or choose a different parent directory.", exit_code=1)
+    except PermissionError:
+         print_error(f"Permission denied: Cannot create or write to export directory '{export_dir}'. Check permissions.", exit_code=1)
+    except Exception as e:
+        print_error(f"Failed to create or access export directory '{export_dir}': {e}", exit_code=1)
+    print_success(f"Using export directory: {export_dir}")
+
+    # --- Find Source Instance ---
+    src_conf_path, src_instance_type = find_instance_config(src_id)
+    if not src_conf_path:
+        print_error(f"Error: No VM or LXC with ID {src_id} found.", exit_code=1)
+
+    src_instance_id_str, src_instance_name, config_type_str = get_instance_details(src_conf_path)
+    print_success(f"Selected source: ID {src_instance_id_str} ({config_type_str}: {src_instance_name})")
+
+    # --- Find ZFS Datasets ---
+    # Use the *source* arguments here
+    storage_datasets, _ = find_zfs_datasets(src_conf_path, source_pve_storage, source_zfs_pool_path)
+    if not storage_datasets:
+        print_error(f"No ZFS datasets found for source storage '{source_pve_storage}' (Pool: '{source_zfs_pool_path}') in {src_conf_path}. Cannot export.", exit_code=1)
+
+    # --- Select Reference Dataset & Snapshot ---
+    ref_key, ref_dataset = select_reference_dataset(storage_datasets, src_instance_type)
+    if not ref_key: sys.exit(1) # Error already printed
+
+    selected_snapshot_full_name, snap_suffix = select_snapshot(ref_dataset)
+    ref_snapshot_name = f"{ref_dataset}@{snap_suffix}" # Full name of the reference snapshot
+
+    # --- Export Config ---
+    config_export_path = export_dir / f"{src_id}{DEFAULT_EXPORT_CONFIG_SUFFIX}"
+    print_info(f"\nExporting configuration to: {color_text(str(config_export_path), 'BLUE')}")
+    try:
+        shutil.copy2(src_conf_path, config_export_path)
+        print_success(f"Configuration file exported successfully.")
+    except Exception as e:
+        print_error(f"Failed to export configuration file: {e}", exit_code=1)
+
+    # --- Export ZFS Data (All Disks using the selected snapshot suffix) ---
+    print_info(f"\n--- Starting ZFS Data Export (Snapshot Suffix: {snap_suffix}) ---")
+    exported_disks_metadata = []
+    all_data_ops_successful = True
+    pv_available = is_tool('pv')
+
+    for key, dataset_path in storage_datasets.items():
+        # Construct snapshot name for the current dataset
+        target_snapshot = f"{dataset_path}@{snap_suffix}"
+        stream_filename = f"{key}{DEFAULT_EXPORT_DATA_SUFFIX}"
+        data_export_path = export_dir / stream_filename
+
+        print(f"\n {color_text(f'Exporting {key}:', 'CYAN')}")
+        print(f"    Source dataset:  {color_text(dataset_path, 'BLUE')}")
+        print(f"    Source snapshot: {color_text(target_snapshot, 'BLUE')}")
+        print(f"    Output file:     {color_text(str(data_export_path), 'BLUE')}")
+
+        # Check snapshot exists for this specific dataset
+        if not get_zfs_property(target_snapshot, 'type'):
+            print_warning(f"    [WARN] Snapshot '{target_snapshot}' does not exist for this dataset. Skipping export for {key}.")
+            continue # Skip this disk
+
+        estimated_size_bytes = get_snapshot_size_estimate(target_snapshot)
+        size_str = f"~{format_bytes(estimated_size_bytes)}" if estimated_size_bytes is not None else "Unknown size"
+        print(f"    Estimated size: {size_str}")
+
+        # Prepare commands for pipeline: zfs send | pv > file
+        send_cmd = ['zfs', 'send', target_snapshot]
+        pipeline_cmds = [send_cmd]
+        pipeline_names = ["zfs send"]
+        pv_opts = None
+
+        if pv_available:
+            pv_cmd_base = ['pv']
+            # Add -W (wait) for export might help ensure file is flushed before next step?
+            pv_opts = ['-W', '-p', '-t', '-r', '-b', '-N', f'export-{key}']
+            if estimated_size_bytes: pv_opts.extend(['-s', str(estimated_size_bytes)])
+            pipeline_cmds.append(pv_cmd_base)
+            pipeline_names.append("pv")
+        else:
+            print_warning("    Executing export without progress bar ('pv' not found).")
+
+        # Execute pipeline with output redirection to file
+        print(f"    Executing pipeline: {' | '.join([' '.join(c) for c in pipeline_cmds])} > {data_export_path}")
+        pipeline_successful = run_pipeline(pipeline_cmds, pipeline_names, pv_options=pv_opts, output_file=data_export_path)
+
+        if pipeline_successful:
+             print_success(f"    ZFS data for {key} exported successfully.")
+             exported_disks_metadata.append({
+                 'key': key,
+                 'original_dataset_basename': Path(dataset_path).name, # Store original basename
+                 'original_dataset_path': dataset_path, # Store full original path too
+                 'stream_file': stream_filename
+             })
+        else:
+            print_error(f"    Error during ZFS data export for {key}.")
+            all_data_ops_successful = False
+            # If one disk fails, should we abort the whole export? Or continue?
+            # Let's continue but report failure at the end.
+            # Optionally try to remove the failed partial file
+            if data_export_path.exists():
+                 print_warning(f"Attempting to remove potentially incomplete file: {data_export_path}")
+                 try: data_export_path.unlink()
+                 except OSError as del_err: print_warning(f"Could not remove file: {del_err}")
+
+
+    # --- Write Metadata File ---
+    meta_export_path = export_dir / f"{src_id}{DEFAULT_EXPORT_META_SUFFIX}"
+    print_info(f"\nWriting metadata file: {color_text(str(meta_export_path), 'BLUE')}")
+
+    if not exported_disks_metadata and all_data_ops_successful:
+         # This case means snapshots existed but maybe for none of the actual disks?
+         print_warning("No disk data was exported (maybe snapshots only existed for reference disk?). Metadata file will be minimal.")
+         # We should still write a metadata file indicating the attempt.
+
+    metadata = {
+        "exported_at": datetime.now().isoformat(),
+        "script_version": "pve-zfs-clone-script-v_adjusted", # Add a version marker if desired
+        "source_id": src_id,
+        "source_instance_type": src_instance_type,
+        "source_config_file": config_export_path.name,
+        "source_pve_storage": source_pve_storage, # Record the source storage used
+        "source_zfs_pool_path": source_zfs_pool_path, # Record the source pool used
+        "snapshot_suffix": snap_suffix,
+        "reference_snapshot_name": ref_snapshot_name, # Full name of the ref snapshot used for selection
+        "exported_disks": exported_disks_metadata # List of dicts for successfully exported disks
+    }
+    try:
+        with open(meta_export_path, 'w') as f_meta:
+            json.dump(metadata, f_meta, indent=4)
+        print_success(f"Metadata file written successfully.")
+    except Exception as e:
+        print_error(f"Failed to write metadata file: {e}")
+        all_data_ops_successful = False # Mark export as failed if metadata fails
+
+    # --- Final Message ---
+    print(f"\n{color_text('--- Export Process Finished ---', 'GREEN' if all_data_ops_successful else 'YELLOW')}")
+    print(f"Exported {config_type_str} ID {src_id} (using snapshot suffix '{snap_suffix}')")
+    print(f"  Target Directory: {export_dir}")
+    print(f"  Config File:      {config_export_path.name}")
+    print(f"  Metadata File:    {meta_export_path.name}")
+    if exported_disks_metadata:
+        print(f"  Data Files ({len(exported_disks_metadata)} exported):")
+        for disk_info in exported_disks_metadata:
+            print(f"    - {disk_info['stream_file']} (for key: {disk_info['key']}, original: {disk_info['original_dataset_basename']})")
+    else:
+         print(f"  Data Files:       {color_text('None exported.', 'YELLOW')}")
+
+
+    if not all_data_ops_successful:
+        print_warning("\nNote: Some ZFS data export operations or metadata writing may have failed. Review logs carefully.")
+        print(color_text("The export might be incomplete or unusable.", "RED"))
+        # Suggest removing the directory?
+        print(color_text(f"Consider removing the potentially incomplete export directory: {export_dir}", "YELLOW"))
+    else:
+        print(color_text("\nStore the entire export directory securely.", "YELLOW"))
+
+
+def do_restore(args):
+    """Führt den Wiederherstellungsvorgang durch."""
+    print_info("=== Running Restore Mode ===")
+    import_dir = Path(args.import_dir).resolve() # Use resolved path
+    new_id = args.new_id
+    # Use arguments passed, falling back to defaults if not provided
+    target_zfs_pool_path = args.target_zfs_pool_path
+    target_pve_storage = args.target_pve_storage
+
+    # --- Validate Import Directory and Files ---
+    print_info(f"Checking import directory: {color_text(str(import_dir), 'BLUE')}")
+    if not import_dir.is_dir():
+        print_error(f"Import directory not found or not a directory: {import_dir}", exit_code=1)
+
+    # Find the metadata file (expect exactly one)
+    potential_meta_files = list(import_dir.glob(f"*{DEFAULT_EXPORT_META_SUFFIX}"))
+    if not potential_meta_files:
+        print_error(f"No metadata file (*{DEFAULT_EXPORT_META_SUFFIX}) found in {import_dir}", exit_code=1)
+    if len(potential_meta_files) > 1:
+        print_warning(f"Multiple metadata files found in {import_dir}. Using the first one: {potential_meta_files[0].name}")
+    meta_import_path = potential_meta_files[0]
+
+    # --- Read Metadata ---
+    print_info(f"Reading metadata from: {meta_import_path.name}")
+    metadata = None
+    try:
+        with open(meta_import_path, 'r') as f_meta:
+            metadata = json.load(f_meta)
+        print_success("Metadata loaded successfully.")
+
+        # Validate essential keys
+        original_id = metadata.get("source_id")
+        original_instance_type = metadata.get("source_instance_type")
+        exported_disks = metadata.get("exported_disks") # This is a list of dicts
+
+        if not original_id: raise ValueError("Missing 'source_id' in metadata.")
+        if not original_instance_type or original_instance_type not in ['vm', 'lxc']:
+             raise ValueError("Missing or invalid 'source_instance_type' (must be 'vm' or 'lxc') in metadata.")
+        if exported_disks is None: raise ValueError("Missing 'exported_disks' list in metadata.")
+        if not isinstance(exported_disks, list):
+             raise ValueError("'exported_disks' in metadata is not a list.")
+
+        # Check keys within exported_disks list
+        for i, disk_info in enumerate(exported_disks):
+             if not disk_info.get("key"): raise ValueError(f"Disk entry {i} missing 'key'.")
+             if not disk_info.get("original_dataset_basename"): raise ValueError(f"Disk entry {i} missing 'original_dataset_basename'.")
+             if not disk_info.get("stream_file"): raise ValueError(f"Disk entry {i} missing 'stream_file'.")
+
+        print(f"   Original ID:       {original_id}")
+        print(f"   Original Type:     {original_instance_type.upper()}")
+        print(f"   Disks in export:   {len(exported_disks)}")
+
+    except json.JSONDecodeError:
+        print_error(f"Failed to decode metadata file (invalid JSON): {meta_import_path}", exit_code=1)
+    except ValueError as ve:
+         print_error(f"Invalid or incomplete metadata in {meta_import_path}: {ve}", exit_code=1)
+    except Exception as e:
+        print_error(f"Failed to read or parse metadata file {meta_import_path}: {e}", exit_code=1)
+
+    # --- Find Config File ---
+    # Use filename from metadata if present, otherwise construct default
+    config_filename = metadata.get("source_config_file")
+    if not config_filename:
+        config_filename = f"{original_id}{DEFAULT_EXPORT_CONFIG_SUFFIX}"
+        print_warning(f"Config filename not specified in metadata, assuming default: {config_filename}")
+
+    config_import_path = import_dir / config_filename
+    if not config_import_path.is_file():
+         print_error(f"Required config file '{config_filename}' not found in {import_dir}", exit_code=1)
+    print(f"   Config file found: {config_filename}")
+
+    # --- Determine and Validate Target ID ---
+    pve_cmd = "qm" if original_instance_type == "vm" else "pct"
+    conf_dir_name = "qemu-server" if original_instance_type == "vm" else "lxc"
+    target_conf_dir = Path("/etc/pve") / conf_dir_name
+
+    if not new_id:
+        default_new_id = f"8{original_id}" # Different prefix for restore default
+        try:
+            new_id_input = input(f"Enter the new {original_instance_type.upper()} ID for restore (blank for default={default_new_id}): ").strip()
+            new_id = new_id_input or default_new_id
+            if not new_id.isdigit() or int(new_id) <= 0:
+                 print_error(f"Invalid new ID '{new_id}'. Must be a positive integer.", exit_code=1)
+            if new_id == default_new_id and not new_id_input:
+                print_warning(f"Using default ID: {new_id}")
+        except ValueError:
+             print_error("Invalid input for new ID.", exit_code=1)
+        except EOFError:
+            print_error("\nNon-interactive mode: New ID must be provided as an argument.", exit_code=1)
+
+
+    # Check for config file collision
+    new_conf_path = target_conf_dir / f"{new_id}.conf"
+    config_collision = False
+    if new_conf_path.exists():
+        print_error(f"Config file for target ID {new_id} ({new_conf_path}) already exists!");
+        config_collision = True
+
+    # --- Check for Target Dataset Collisions ---
+    print_info("\nChecking for potential target dataset collisions...")
+    potential_targets = {} # {original_key: new_dataset_full_path}
+    dataset_collision_found = False
+    if not exported_disks:
+        # This should have been caught by metadata validation, but double-check
+        print_warning("No disks listed in metadata to restore, proceeding to config only.")
+    else:
+        for disk_info in exported_disks:
+            original_key = disk_info["key"]
+            # Use original_dataset_path if available, otherwise reconstruct from basename and pool
+            original_path_for_naming = disk_info.get("original_dataset_path")
+            if not original_path_for_naming:
+                 # Reconstruct using original pool path from metadata if available, else the *target* pool path as a fallback
+                 original_pool = metadata.get("source_zfs_pool_path", target_zfs_pool_path)
+                 original_basename = disk_info["original_dataset_basename"]
+                 original_path_for_naming = f"{original_pool.rstrip('/')}/{original_basename}"
+                 print_warning(f"Original full path for key '{original_key}' not in metadata, reconstructed as '{original_path_for_naming}' for naming.")
+
+            # Use the target ZFS pool path provided by argument/default
+            new_dataset_path = generate_new_dataset_name(original_path_for_naming, original_id, new_id, target_zfs_pool_path)
+            potential_targets[original_key] = new_dataset_path
+            if get_zfs_property(new_dataset_path, 'type'):
+                print_error(f"Target ZFS dataset '{new_dataset_path}' for key '{original_key}' already exists.")
+                dataset_collision_found = True
+
+    if config_collision or dataset_collision_found:
+        print_error("Aborting restore due to collision(s).", exit_code=1)
+    print_success("No target configuration or dataset collisions found.")
+
+
+    # --- Restore ZFS Data (All Disks) ---
+    print_info(f"\n--- Starting ZFS Restore Operations ---")
+    print_info(f"Target ZFS Pool Path: {target_zfs_pool_path}")
+    print_info(f"Target PVE Storage: {target_pve_storage}")
+
+    restored_datasets_map = {} # {original_key: new_dataset_basename}
+    all_data_ops_successful = True
+    pv_available = is_tool('pv')
+    cleanup_list = [] # Keep track of created datasets for potential rollback
+
+    if not exported_disks:
+        print_info("No ZFS disks to restore based on metadata.")
+    else:
+        for disk_info in exported_disks:
+            original_key = disk_info["key"]
+            stream_filename = disk_info["stream_file"]
+            data_import_path = import_dir / stream_filename
+            new_dataset_path = potential_targets[original_key] # Get pre-calculated target path
+
+            print(f"\n {color_text(f'Restoring {original_key}:', 'CYAN')}")
+            print(f"    Input stream:   {color_text(str(data_import_path.name), 'BLUE')}")
+            print(f"    Target dataset: {color_text(new_dataset_path, 'GREEN')}")
+
+            if not data_import_path.is_file():
+                print_error(f"Data stream file '{data_import_path.name}' not found in {import_dir}. Aborting.")
+                all_data_ops_successful = False
+                break # Stop restore if a required data file is missing
+
+            # Prepare pipeline: cat file | pv | zfs receive
+            recv_cmd = ['zfs', 'receive', '-o', 'readonly=off', new_dataset_path] # Ensure dataset is writable
+            pipeline_cmds = []
+            pipeline_names = []
+            pv_opts = None
+
+            # Use 'cat' to feed the file into the pipeline
+            cat_cmd = ['cat', str(data_import_path)]
+            pipeline_cmds.append(cat_cmd)
+            pipeline_names.append("cat")
+
+            if pv_available:
+                pv_cmd_base = ['pv']
+                try: file_size = data_import_path.stat().st_size
+                except Exception: file_size = None
+                size_str = f"~{format_bytes(file_size)}" if file_size is not None else "Unknown size"
+                print(f"    Input file size: {size_str}")
+
+                # Add -W (wait) might be good practice
+                pv_opts = ['-W', '-p', '-t', '-r', '-b', '-N', f'restore-{original_key}']
+                if file_size: pv_opts.extend(['-s', str(file_size)])
+                pipeline_cmds.append(pv_cmd_base)
+                pipeline_names.append("pv")
+            else:
+                print_warning("    Executing restore without progress bar ('pv' not found).")
+
+            pipeline_cmds.append(recv_cmd)
+            pipeline_names.append("zfs receive")
+
+            print(f"    Executing pipeline: {' | '.join([' '.join(c) for c in pipeline_cmds])}")
+            pipeline_successful = run_pipeline(pipeline_cmds, pipeline_names, pv_options=pv_opts, output_file=None)
+
+            if pipeline_successful:
+                print_success(f"    ZFS data restore successful for {original_key}.")
+                restored_datasets_map[original_key] = Path(new_dataset_path).name # Store basename for config
+                cleanup_list.append(new_dataset_path) # Add to cleanup list
+            else:
+                print_error(f"Error during 'zfs receive' pipeline for {original_key}. Aborting restore.")
+                all_data_ops_successful = False
+                # Attempt to remove the failed dataset immediately? Or cleanup all at the end?
+                # Let's break and cleanup all successfully created ones so far.
+                break
+
+    # --- Cleanup if ZFS Restore Failed ---
+    if not all_data_ops_successful:
+        print_error("\n--- Restore Failed During ZFS Operations ---")
+        if cleanup_list:
+             print_warning("Attempting to clean up successfully restored datasets...")
+             for ds_path in reversed(cleanup_list): # Destroy in reverse order of creation
+                 print_warning(f"    Destroying partially restored dataset: {ds_path}")
+                 run_command(['zfs', 'destroy', '-r', ds_path], check=False, capture_output=False, suppress_stderr=True)
+        else:
+             print_info("No datasets were created before failure occurred.")
+        sys.exit(1)
+
+
+    # --- Create and Adjust Configuration File ---
+    print_info(f"\nCreating and adjusting new configuration file: {color_text(str(new_conf_path), 'BLUE')}")
+    config_created_successfully = False
+    try:
+        shutil.copy2(config_import_path, new_conf_path)
+        print_success(f"Copied base configuration from {config_import_path.name} to {new_conf_path}.")
+
+        adjust_config_file(
+            conf_path=new_conf_path,
+            instance_type=original_instance_type,
+            new_id=new_id, # Pass new_id
+            target_pve_storage=target_pve_storage, # Pass the target storage name
+            dataset_map=restored_datasets_map, # Map original keys to new basenames
+            name_prefix="restored-"
+        )
+        config_created_successfully = True
+
+    except Exception as e:
+        print_error(f"Error processing config file {new_conf_path}: {e}")
+        # Attempt cleanup of config file AND restored datasets
+        if new_conf_path.exists():
+            print_warning(f"Removing potentially incomplete config file: {new_conf_path}")
+            try: new_conf_path.unlink()
+            except OSError: pass
+        # Cleanup ZFS datasets if config failed
+        if cleanup_list:
+             print_warning("Attempting to clean up restored ZFS datasets due to config error...")
+             for ds_path in reversed(cleanup_list):
+                  print_warning(f"    Destroying restored dataset: {ds_path}")
+                  run_command(['zfs', 'destroy', '-r', ds_path], check=False, capture_output=False, suppress_stderr=True)
+        sys.exit(1)
+
+    # --- Final Message ---
+    if all_data_ops_successful and config_created_successfully:
+        print(f"\n{color_text('--- Restore Process Finished ---', 'GREEN')}")
+        print(f"Restored {original_instance_type.upper()} from export directory '{import_dir}'")
+        print(f"  New ID:              {color_text(new_id, 'BLUE')}")
+        print(f"  Target PVE Storage: {color_text(target_pve_storage, 'BLUE')}")
+        if restored_datasets_map:
+             print(f"  Restored Datasets ({len(restored_datasets_map)}):")
+             for key, basename in restored_datasets_map.items():
+                 # Use the target ZFS pool path provided by argument/default
+                 full_path = f"{target_zfs_pool_path.rstrip('/')}/{basename}"
+                 print(f"    - {key} -> {color_text(full_path, 'BLUE')}")
+        else:
+             print("  Restored Datasets: None")
+        print(f"{color_text('Review the configuration:', 'YELLOW')} {color_text(str(new_conf_path), 'BLUE')}")
+        print(color_text("Important checks: Network settings (IP/MAC), Hostname/Name, Resources, CD-ROMs (VMs), link_down=1 on NICs.", 'YELLOW'))
+    else:
+         # Should have exited earlier if something failed, but as a fallback:
+         print(f"\n{color_text('--- Restore Process Failed ---', 'RED')}")
+
+
+def perform_ram_check(pve_cmd, src_id):
+    """Prüft die RAM-Nutzung des Hosts vor dem Klonen einer VM."""
+    print_info("\nChecking host RAM usage...")
+    try:
+        # Get total host RAM using 'free -m'
+        free_output = run_command(['free', '-m'], capture_output=True, check=True)
+        mem_line = free_output.split('\n')[1]
+        total_ram_mb = int(mem_line.split()[1])
+
+        # Get source VM RAM from its config
+        src_vm_ram_mb = 512 # Default fallback
+        # Use 'qm config' which is generally available
+        qm_config_output = run_command([pve_cmd, 'config', src_id], capture_output=True, suppress_stderr=True, check=True)
+        match_mem = re.search(r'^memory:\s*(\S+)', qm_config_output, re.MULTILINE | re.IGNORECASE)
+        if match_mem:
+            parsed_ram = parse_size_to_mb(match_mem.group(1))
+            src_vm_ram_mb = parsed_ram if parsed_ram > 0 else 0 # Allow 0 initially
+
+            if src_vm_ram_mb == 0: # Handle 'memory: 0' -> check minimum or ballooning
+                 min_mem_match = re.search(r'^minimum:\s*(\S+)', qm_config_output, re.MULTILINE | re.IGNORECASE)
+                 balloon_match = re.search(r'^balloon:\s*(\S+)', qm_config_output, re.MULTILINE | re.IGNORECASE)
+
+                 min_ram_mb = 0
+                 if min_mem_match:
+                      min_ram_mb = parse_size_to_mb(min_mem_match.group(1))
+
+                 balloon_mb = 0
+                 if balloon_match:
+                      balloon_val = balloon_match.group(1)
+                      if balloon_val.lower() == '0': # Ballooning disabled
+                          balloon_mb = 0
+                      else: # Ballooning enabled, use value if numeric, else default
+                          balloon_mb = parse_size_to_mb(balloon_val) if balloon_val.isdigit() else 512
+
+                 # Use minimum if set, else balloon if set and > 0, else default
+                 if min_ram_mb > 0:
+                      src_vm_ram_mb = min_ram_mb
+                      print_warning(f"VM {src_id} 'memory' is 0, using 'minimum': {src_vm_ram_mb} MB for check.")
+                 elif balloon_mb > 0:
+                      src_vm_ram_mb = balloon_mb
+                      print_warning(f"VM {src_id} 'memory' is 0, using 'balloon': {src_vm_ram_mb} MB for check.")
+                 else:
+                      src_vm_ram_mb = 512 # Fallback if memory=0 and no min/balloon
+                      print_warning(f"VM {src_id} 'memory' is 0 and no valid 'minimum' or 'balloon' found, using default: {src_vm_ram_mb} MB for check.")
+        elif 'memory' in qm_config_output.lower(): # Line exists but couldn't parse value
+             print_warning(f"Could not parse 'memory' value for VM {src_id}, assuming {src_vm_ram_mb} MB for check.")
+        else: # 'memory' line not found at all
+             print_warning(f"No 'memory' setting found for VM {src_id}, assuming {src_vm_ram_mb} MB for check.")
+
+
+        # Sum RAM of all *running* VMs
+        # Use 'qm list' which provides memory usage directly
+        qm_list_output = run_command([pve_cmd, 'list', '--full'], capture_output=True, suppress_stderr=True, check=True)
+        sum_running_ram_mb = 0
+        running_vm_lines = [line for line in qm_list_output.split('\n')[1:] if 'running' in line.split()]
+        header_line = qm_list_output.split('\n')[0].lower() # Lowercase for easier matching
+        headers = header_line.split()
+
+        # Find column index for memory (prefer maxmem, fallback to mem)
+        mem_index = -1
+        for col_name in ['maxmem', 'mem']: # Order of preference
+            try: mem_index = headers.index(col_name); break
+            except ValueError: pass
+
+        if mem_index == -1:
+            print_warning("Could not determine memory column ('maxmem' or 'mem') in 'qm list' output. RAM check might be inaccurate.")
+            # Fallback: Try to guess based on typical position? Risky.
+            # Let's proceed without summing running VMs if column not found.
+            sum_running_ram_mb = -1 # Indicate failure to sum
+        else:
+             for line in running_vm_lines:
+                 parts = line.split()
+                 vmid = parts[0]
+                 if vmid.isdigit() and len(parts) > mem_index:
+                     try:
+                         # Value is in bytes in 'qm list' output
+                         ram_bytes = int(parts[mem_index])
+                         current_vm_ram_mb = ram_bytes // (1024*1024) if ram_bytes > 0 else 0
+                         sum_running_ram_mb += current_vm_ram_mb
+                     except (ValueError, IndexError):
+                         print_warning(f"Could not parse memory for running VM {vmid} from 'qm list'.")
+                         # Could try qm config as a fallback here, but might slow down significantly
+                         sum_running_ram_mb += 512 # Add default as a guess
+
+
+        # Perform the check and warn user
+        threshold_mb = math.floor(total_ram_mb * RAM_THRESHOLD_PERCENT / 100)
+        print(f"   Total host RAM:      {color_text(format_bytes(total_ram_mb*1024*1024), 'BLUE')}")
+        if sum_running_ram_mb >= 0:
+            print(f"   RAM running VMs (sum):{color_text(format_bytes(sum_running_ram_mb*1024*1024), 'BLUE')}")
+            print(f"   Source VM RAM (Est.):{color_text(format_bytes(src_vm_ram_mb*1024*1024), 'BLUE')}")
+            prognostic_ram_mb = sum_running_ram_mb + src_vm_ram_mb
+            print(f"   Projected Total RAM: {color_text(format_bytes(prognostic_ram_mb*1024*1024), 'BLUE')} (if clone starts)")
+            print(f"   {RAM_THRESHOLD_PERCENT}% Threshold:        {color_text(format_bytes(threshold_mb*1024*1024), 'BLUE')}")
+
+            if prognostic_ram_mb > threshold_mb:
+                print_warning(f"\nWARNING: Starting the clone might exceed the {RAM_THRESHOLD_PERCENT}% host RAM usage threshold!")
+                try:
+                     confirm = input(f"{color_text('Continue anyway? (y/N) ', 'RED')}{COLORS['NC']}").strip().lower()
+                     if confirm not in ['y', 'yes']:
+                         print_error("Operation aborted by user due to RAM concerns.", exit_code=1)
+                     else:
+                         print_info("Continuing despite RAM warning.")
+                except EOFError: # Handle non-interactive session
+                     print_error("Operation aborted due to RAM concerns (non-interactive).", exit_code=1)
+            else: print_success("RAM check passed.")
+        else:
+             print_warning("Could not reliably sum RAM of running VMs. Skipping threshold check.")
+
+    except subprocess.CalledProcessError as e:
+         print_warning(f"\nCould not execute command for RAM check: {e}. Proceeding cautiously.")
+    except Exception as e:
+        print_warning(f"\nCould not complete RAM check due to unexpected error: {e}. Proceeding cautiously.")
+
+
+# --- Main Execution ---
+
+def main():
+    # --- Argument Parser Setup ---
+    # Add epilog for usage examples
+    examples = f"""
+Examples:
+
+  {color_text('List available VMs/LXCs:', 'YELLOW')}
+    {sys.argv[0]} --list
+
+  {color_text('Clone VM 100 to 9100 (linked clone, prompts for snapshot, uses default storage/pool):', 'YELLOW')}
+    sudo {sys.argv[0]} clone 100 9100
+
+  {color_text('Clone LXC 105 to 9105 (full clone, prompts for snapshot, specify target storage/pool):', 'YELLOW')}
+    sudo {sys.argv[0]} clone 105 9105 --clone-mode full --target-pve-storage tank/pve --target-zfs-pool-path tank/pve/data
+
+  {color_text('Clone VM 102, prompt for new ID and snapshot (linked, uses default storage/pool):', 'YELLOW')}
+    sudo {sys.argv[0]} clone 102
+
+  {color_text('Export VM 101 to /mnt/backup/export/101 (prompts for snapshot, specify source storage/pool):', 'YELLOW')}
+    sudo {sys.argv[0]} export 101 /mnt/backup/export --source-pve-storage local-zfs --source-zfs-pool-path rpool/data
+
+  {color_text('Restore from /mnt/backup/export/101 to new ID 8101 (uses default target storage/pool):', 'YELLOW')}
+    sudo {sys.argv[0]} restore /mnt/backup/export/101 8101
+
+  {color_text('Restore from /mnt/backup/export/105, prompt for new ID, specify target storage/pool:', 'YELLOW')}
+    sudo {sys.argv[0]} restore /mnt/backup/export/105 --target-pve-storage tank/pve --target-zfs-pool-path tank/pve/data
+
+Configuration Note:
+  - Target ZFS pool path for clone/restore defaults to: {color_text(DEFAULT_ZFS_POOL_PATH, 'BLUE')}
+  - Target PVE storage name for clone/restore defaults to: {color_text(DEFAULT_PVE_STORAGE, 'BLUE')}
+  (These can be overridden using the --target-zfs-pool-path and --target-pve-storage options.)
+"""
+    parser = argparse.ArgumentParser(
+        description="Proxmox VM/LXC Clone, Export, or Restore script using ZFS snapshots.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=examples
+    )
+
+    # --- Global Options ---
+    parser.add_argument('--list', action='store_true', help="List available VMs and LXC containers and exit.")
+    # Add target options back as global options affecting clone/restore
+    parser.add_argument('--target-zfs-pool-path', default=DEFAULT_ZFS_POOL_PATH,
+                        help=f"Base path for target ZFS datasets (clone/restore). Default: {DEFAULT_ZFS_POOL_PATH}")
+    parser.add_argument('--target-pve-storage', default=DEFAULT_PVE_STORAGE,
+                        help=f"PVE storage name for target datasets (clone/restore). Default: {DEFAULT_PVE_STORAGE}")
+
+
+    # --- Subparsers for Modes ---
+    subparsers = parser.add_subparsers(dest='mode', help='Operation mode (clone, export, restore)')
+
+    # --- Clone Mode ---
+    parser_clone = subparsers.add_parser('clone', help='Clone a VM/LXC from a ZFS snapshot.', formatter_class=argparse.RawTextHelpFormatter)
+    parser_clone.add_argument('source_id', help="ID of the source VM or LXC to clone.")
+    parser_clone.add_argument('new_id', nargs='?', default=None,
+                              help="ID for the new cloned instance. (Default: 9<source_id>, will prompt if omitted)")
+    parser_clone.add_argument('--clone-mode', choices=['linked', 'full'], default='linked',
+                              help="Type of ZFS clone ('linked' uses 'zfs clone', 'full' uses send/receive). Default: linked")
+
+    # --- Export Mode ---
+    parser_export = subparsers.add_parser('export', help='Export a VM/LXC config and ZFS snapshot data.', formatter_class=argparse.RawTextHelpFormatter)
+    parser_export.add_argument('source_id', help="ID of the source VM or LXC to export.")
+    parser_export.add_argument('export_dir',
+                               help="Parent directory where the export subdirectory (named after source_id) will be created (e.g., /mnt/backups).")
+    # Keep source arguments specific to export
+    parser_export.add_argument('--source-zfs-pool-path', default=DEFAULT_ZFS_POOL_PATH,
+                               help=f"Base path where source ZFS datasets reside. Default: {DEFAULT_ZFS_POOL_PATH}")
+    parser_export.add_argument('--source-pve-storage', default=DEFAULT_PVE_STORAGE,
+                               help=f"PVE storage name linked in the source config. Default: {DEFAULT_PVE_STORAGE}")
+
+
+    # --- Restore Mode ---
+    parser_restore = subparsers.add_parser('restore', help='Restore a VM/LXC from an exported directory.', formatter_class=argparse.RawTextHelpFormatter)
+    parser_restore.add_argument('import_dir',
+                                help="Path to the specific export directory containing the .conf, .meta.json, and .zfs.stream files (e.g., /mnt/backups/101).")
+    parser_restore.add_argument('new_id', nargs='?', default=None,
+                                help="ID for the new restored instance. (Default: 8<original_id>, will prompt if omitted)")
+
+
+    args = parser.parse_args()
+
+    # --- Handle --list option ---
+    if args.list:
+        if os.geteuid() != 0:
+            print_warning("Root privileges might be needed to read all config files for listing.")
+        if list_instances():
+             sys.exit(0)
+        else:
+             sys.exit(1) # Exit if listing failed somehow
+
+    # --- Mode selection needed if --list wasn't used ---
+    if not args.mode:
+        parser.print_help()
+        print_error("\nError: You must specify an operation mode (clone, export, restore) or use --list.", exit_code=1)
+
+
+    # --- Initial Checks (only if a mode is selected) ---
+    if os.geteuid() != 0:
+        print_warning("Warning: Root privileges (sudo) are likely required for ZFS/Proxmox commands.")
+
+    # Check for 'pv' tool
+    pv_available = is_tool('pv')
+    if not pv_available:
+        print_warning("Tool 'pv' (Pipe Viewer) not found. Operations involving data streams will not show progress bars.")
+    else:
+        print_info("Tool 'pv' found, will be used for progress display.")
+
+
+    # --- Execute Selected Mode ---
+    if args.mode == 'clone':
+        do_clone(args)
+    elif args.mode == 'export':
+        do_export(args)
+    elif args.mode == 'restore':
+        do_restore(args)
+    else:
+        # Should have been caught earlier, but as a fallback
+        parser.print_help()
+        sys.exit(1)
 
     sys.exit(0)
 
 
-# --- Skriptstart ---
 if __name__ == "__main__":
-    # Prüfe auf Root-Rechte
-    if os.geteuid() != 0:
-        print_warning("Warning: Root privileges (sudo) likely required for ZFS/Proxmox commands.")
-
     try:
         main()
     except KeyboardInterrupt:
-        print_error("\nOperation cancelled by user (Ctrl+C).")
-        sys.exit(1)
+        print_error("\nOperation cancelled by user (Ctrl+C).", exit_code=130) # Standard exit code for Ctrl+C
     except Exception as e:
-        # Catchall für unerwartete Fehler
         print_error(f"\nAn unexpected critical error occurred: {e}")
-        # Optional: Traceback für Debugging ausgeben
+        # Uncomment the next two lines for detailed debugging traceback
         # import traceback
         # traceback.print_exc()
-        sys.exit(1)
+        sys.exit(2) # General error exit code
