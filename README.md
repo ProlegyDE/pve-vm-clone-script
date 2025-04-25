@@ -29,6 +29,10 @@ chmod +x pve-zfs-utility.py
 *   ZFS storage configured for VMs/LXCs (default used by script: `local-zfs` on pool `rpool/data`, configurable via arguments)
 *   Python 3.7+
 *   Required system tools: `zfs`, `qm` (for VMs), `pct` (for LXC)
+*   Optional for compression:
+    *   gzip / gunzip (usually available)
+    *   pigz / unpigz (for parallel gzip)
+    *   zstd / unzstd (for Zstandard compression)
 *   Recommended: `pv` (Pipe Viewer) for progress display during full clones, exports, and restores.
 
 ## 💻 Features
@@ -73,6 +77,7 @@ sudo ./pve-zfs-utility.py [global_options] <mode> [mode_options]
 ### Key Options:
 
 *   `--clone-mode {linked|full}`: (Clone only) Type of ZFS clone. Default: `linked`.
+*   `--compress {none|gzip|pigz|zstd}`: (Export only) Compression method for ZFS streams. Default: `none`.
 *   `--target-zfs-pool-path <path>`: (Clone/Restore) ZFS pool path for the _target_. Default: `rpool/data`.
 *   `--target-pve-storage <name>`: (Clone/Restore) PVE storage name for the _target_. Default: `local-zfs`.
 *   `--source-zfs-pool-path <path>`: (Export only) ZFS pool path for the _source_. Default: `rpool/data`.
@@ -110,14 +115,26 @@ sudo ./pve-zfs-utility.py [global_options] <mode> [mode_options]
     # The script will create the '101' subdirectory inside /mnt/backup/export
     sudo ./pve-zfs-utility.py export 101 /mnt/backup/export --source-pve-storage local-zfs --source-zfs-pool-path rpool/data
     ```
+
+6.  **Export LXC 105 to /mnt/backup/export/105 using zstd compression**
     
-6.  **Restore from `/mnt/backup/export/101` to new ID 8101 (uses default target storage/pool):**
+    ```bash
+    sudo ./pve-zfs-utility.py export 105 /mnt/backup/export --compress zstd
+    ```
+
+7.  **Export VM 101 with specified source storage/pool using pigz compression**
+
+    ```bash
+    sudo ./pve-zfs-utility.py export 101 /mnt/backup/export --source-pve-storage local-zfs --source-zfs-pool-path rpool/data --compress pigz
+    ```    
+
+8.  **Restore from `/mnt/backup/export/101` to new ID 8101 (uses default target storage/pool):**
     
     ```bash
     sudo ./pve-zfs-utility.py restore /mnt/backup/export/101 8101
     ```
     
-7.  **Restore from `/mnt/backup/export/105`, prompt for new ID, specify target storage/pool:**
+9.  **Restore from `/mnt/backup/export/105`, prompt for new ID, specify target storage/pool:**
     
     ```bash
     sudo ./pve-zfs-utility.py restore /mnt/backup/export/105 --target-pve-storage tank/pve --target-zfs-pool-path tank/pve/data
@@ -134,6 +151,7 @@ The script uses these internal defaults, which can be overridden by command-line
 *   `DEFAULT_EXPORT_META_SUFFIX = ".meta.json"`
 *   `DEFAULT_EXPORT_DATA_SUFFIX = ".zfs.stream"`
 *   `DEFAULT_EXPORT_CONFIG_SUFFIX = ".conf"`
+*   Compression suffixes: `.zfs.stream.gz`, `.zfs.stream.zst`
 
 ## ⚖️ License
 
