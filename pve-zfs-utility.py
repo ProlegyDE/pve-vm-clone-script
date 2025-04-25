@@ -14,14 +14,25 @@ import argparse
 import json
 
 # --- Default Configuration ---
-# These are now the *defaults* for target paths/storage during clone/restore.
-# They can be overridden by command-line arguments.
 DEFAULT_ZFS_POOL_PATH = "rpool/data"
 DEFAULT_PVE_STORAGE = "local-zfs"
 RAM_THRESHOLD_PERCENT = 90
 DEFAULT_EXPORT_META_SUFFIX = ".meta.json"
 DEFAULT_EXPORT_DATA_SUFFIX = ".zfs.stream"
 DEFAULT_EXPORT_CONFIG_SUFFIX = ".conf"
+# Suffixes for compressed streams
+DEFAULT_EXPORT_DATA_SUFFIX_GZIP = ".zfs.stream.gz"
+DEFAULT_EXPORT_DATA_SUFFIX_ZSTD = ".zfs.stream.zst"
+DEFAULT_EXPORT_DATA_SUFFIX_PIGZ = ".zfs.stream.gz" # Same as gzip
+
+# --- Compression Tools ---
+# Define command names for easier checking and execution
+COMPRESSION_TOOLS = {
+    "gzip": {"compress": ["gzip", "-c"], "decompress": ["gunzip", "-c"], "suffix": DEFAULT_EXPORT_DATA_SUFFIX_GZIP},
+    "pigz": {"compress": ["pigz", "-c"], "decompress": ["unpigz", "-c"], "suffix": DEFAULT_EXPORT_DATA_SUFFIX_PIGZ},
+    "zstd": {"compress": ["zstd", "-T0", "-c"], "decompress": ["unzstd", "-c"], "suffix": DEFAULT_EXPORT_DATA_SUFFIX_ZSTD},
+    "none": {"compress": None, "decompress": None, "suffix": DEFAULT_EXPORT_DATA_SUFFIX}
+}
 
 
 # --- Colors ---
@@ -62,12 +73,42 @@ def print_error(text, exit_code=None):
 
 def is_tool(name):
     """Prüft, ob ein Kommandozeilen-Tool im PATH verfügbar ist."""
+    # Check specifically for the command name (e.g., 'zstd', 'gunzip')
     return shutil.which(name) is not None
+
+def check_compression_tools(method):
+    """Checks if the required compression/decompression tools for a method are available."""
+    tool_info = COMPRESSION_TOOLS.get(method) # Get tool_info first
+
+    if not tool_info: # Handle invalid method early
+        print_error(f"Internal error: Unknown compression method '{method}' defined.")
+        # Return False for checks and None for info, let caller handle None
+        return False, False, None
+
+    if method == "none":
+        # 'none' method is always 'available', no specific tools needed
+        # Return the actual dict for 'none' which contains the correct suffix
+        return True, True, tool_info
+
+    # Check actual tool executables for other methods
+    compress_cmd_name = tool_info["compress"][0] if tool_info.get("compress") else None
+    decompress_cmd_name = tool_info["decompress"][0] if tool_info.get("decompress") else None
+
+    compress_ok = is_tool(compress_cmd_name) if compress_cmd_name else False
+    decompress_ok = is_tool(decompress_cmd_name) if decompress_cmd_name else False
+
+    # Only warn if the command was expected but not found
+    if not compress_ok and compress_cmd_name:
+        print_warning(f"Compression tool '{compress_cmd_name}' for method '{method}' not found.")
+    if not decompress_ok and decompress_cmd_name:
+        print_warning(f"Decompression tool '{decompress_cmd_name}' for method '{method}' not found.")
+
+    # Return tool availability and the info dict
+    return compress_ok, decompress_ok, tool_info
 
 def run_command(cmd_list, check=True, capture_output=True, text=True, error_msg=None, suppress_stderr=False, input_data=None, allow_fail=False):
     """
     Führt einen Shell-Befehl aus und gibt die Ausgabe zurück oder prüft auf Erfolg.
-
     Args:
         cmd_list (list): The command and its arguments.
         check (bool): If True, raise CalledProcessError on non-zero exit code (unless allow_fail=True).
@@ -77,12 +118,10 @@ def run_command(cmd_list, check=True, capture_output=True, text=True, error_msg=
         suppress_stderr (bool): If True and capture_output=True, redirect stderr to DEVNULL.
         input_data (str, optional): Data to pass to the command's stdin.
         allow_fail (bool): If True, don't raise an exception on failure, instead return (success, stdout, stderr).
-
     Returns:
         str: Captured stdout if capture_output=True and allow_fail=False.
         tuple: (bool, str, str) representing (success, stdout, stderr) if allow_fail=True.
         None: If capture_output=False and allow_fail=False.
-
     Raises:
         SystemExit: On command not found or execution error (if check=True and allow_fail=False).
     """
@@ -150,15 +189,13 @@ def run_command(cmd_list, check=True, capture_output=True, text=True, error_msg=
 
 def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
     """
-    Führt eine Befehlspipeline aus (z.B. cmd1 | pv | cmd2).
+    Führt eine Befehlspipeline aus (z.B. cmd1 | pv | compressor | cmd2 > file).
     Kann die Ausgabe des letzten Befehls in eine Datei umleiten.
-
     Args:
         commands (list[list[str]]): List of commands, where each command is a list of strings.
         step_names (list[str], optional): Names for each step for logging.
         pv_options (list[str], optional): Options to pass to the 'pv' command if present.
         output_file (Path, optional): Path object to redirect the final command's stdout to.
-
     Returns:
         bool: True if the entire pipeline completed successfully, False otherwise.
     """
@@ -166,6 +203,9 @@ def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
     num_commands = len(commands)
     if step_names is None:
         step_names = [f"Step {i+1}" for i in range(num_commands)]
+    elif len(step_names) != num_commands:
+        print_warning("Length of step_names does not match number of commands in pipeline.")
+        step_names = [f"Step {i+1}" for i in range(num_commands)] # Fallback
 
     process_info = []
     final_output_handle = None
@@ -176,7 +216,7 @@ def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
         # Open output file if specified (use binary mode for streams)
         if output_file:
             output_file.parent.mkdir(parents=True, exist_ok=True)
-            final_output_handle = open(output_file, 'wb')
+            final_output_handle = open(output_file, 'wb') # Always use binary for streams
 
         for i, cmd in enumerate(commands):
             stdin_source = last_process_stdout
@@ -186,7 +226,8 @@ def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
 
             is_pv_command = (cmd[0] == 'pv')
             # Let pv write to stderr for progress, capture others' stderr
-            stderr_dest = None if is_pv_command else subprocess.PIPE
+            # Also let compression/decompression tools write to stderr (might show stats)
+            stderr_dest = None if is_pv_command or cmd[0] in ['gzip', 'gunzip', 'pigz', 'unpigz', 'zstd', 'unzstd'] else subprocess.PIPE
 
             # Add pv options if this is the pv command
             current_cmd = cmd[:] # Copy
@@ -207,7 +248,14 @@ def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
             # Close the previous process's stdout pipe if it exists
             # This is important to prevent deadlocks and allow SIGPIPE propagation
             if stdin_source:
-                stdin_source.close()
+                # Need to handle potential BrokenPipeError if the reading process exited early
+                try:
+                   stdin_source.close()
+                except BrokenPipeError:
+                    print_warning(f"   Broken pipe closing stdin for: {' '.join(current_cmd)}. Previous process likely exited.")
+                except Exception as pipe_err:
+                    print_warning(f"   Error closing stdin pipe for {' '.join(current_cmd)}: {pipe_err}")
+
 
             # The stdout of the current process becomes the stdin for the next,
             # unless it's the last command writing to a file/stdout.
@@ -224,8 +272,8 @@ def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
         for idx, info in enumerate(process_info):
             proc = info['proc']
             cmd = info['command']
-            is_pv = cmd[0] == 'pv'
-            capture_stderr = not is_pv # Only capture stderr if it wasn't pv
+            # Check if stderr was set to be captured for this command
+            capture_stderr = proc.stderr == subprocess.PIPE
 
             try:
                 # Communicate captures remaining stdout/stderr from pipes
@@ -244,17 +292,27 @@ def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
                 stderr_outputs.append(stderr_content)
 
                 if rc != 0:
-                    success = False
-                    print_error(f"Pipeline failed at {step_names[idx]}: '{' '.join(cmd)}' (rc={rc})")
-                    if stderr_content:
-                        print_error(f"Stderr:\n{stderr_content}")
-                    # Mark as failed, but let remaining communicate calls finish
+                    # Check if the error is expected (e.g., SIGPIPE when reader exits early)
+                    # ZFS send | zstd might get SIGPIPE if zstd fails, this is ok-ish
+                    # Cat | unzstd | zfs recv might get SIGPIPE if zfs recv fails
+                    if rc == -13: # SIGPIPE
+                         print_warning(f"Pipeline step {step_names[idx]} ('{' '.join(cmd)}') exited with SIGPIPE (rc={rc}). Often okay if a later step failed.")
+                         # Don't immediately mark as failed, let subsequent checks decide
+                    else:
+                        success = False
+                        print_error(f"Pipeline failed at {step_names[idx]}: '{' '.join(cmd)}' (rc={rc})")
+                        if stderr_content:
+                            print_error(f"Stderr:\n{stderr_content}")
+                        # Mark as failed, but let remaining communicate calls finish
 
             except subprocess.TimeoutExpired:
                 print_error(f"Pipeline timed out at {step_names[idx]}: '{' '.join(cmd)}'")
                 proc.kill()
                 # Try to communicate again to get any remaining output
-                stdout_data, stderr_data = proc.communicate()
+                try:
+                    stdout_data, stderr_data = proc.communicate(timeout=10) # Short timeout for cleanup
+                except Exception:
+                    pass # Ignore errors during cleanup communicate
                 success = False
                 timed_out = True
                 return_codes.append(proc.returncode if proc.returncode is not None else -1)
@@ -280,10 +338,16 @@ def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
         for p_info in process_info:
              try:
                  if p_info['proc'].poll() is None: # Still running?
+                    # Try terminate first, then kill
                     p_info['proc'].terminate()
-                    p_info['proc'].wait(timeout=5)
+                    try: p_info['proc'].wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                         print_warning(f"Process {' '.join(p_info['command'])} did not terminate gracefully, killing.")
+                         p_info['proc'].kill()
+                         p_info['proc'].wait(timeout=5)
              except ProcessLookupError: pass
-             except Exception: pass # Ignore cleanup errors
+             except Exception as kill_err:
+                  print_warning(f"Error terminating/killing process {' '.join(p_info['command'])}: {kill_err}")
              finally: # Ensure pipes are closed even if termination failed
                  if p_info['proc'].stdin:
                      try: p_info['proc'].stdin.close()
@@ -297,33 +361,43 @@ def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
 
         # Close the output file handle if it was opened
         if final_output_handle:
-            final_output_handle.close()
+            try:
+                final_output_handle.close()
+            except Exception as close_err:
+                 print_warning(f"Error closing output file handle: {close_err}")
 
 
-        # Final success check
-        if success and any(rc is None or rc != 0 for rc in return_codes):
-            print_warning("Pipeline completed but some steps failed or didn't finish correctly.")
-            success = False
+        # Final success check: success is True only if *all* non-None return codes are 0
+        final_success = success and all(rc == 0 for rc in return_codes if rc is not None)
+        # Also check if the number of successful steps matches expected (unless timeout)
+        if not timed_out and len([rc for rc in return_codes if rc == 0]) != len(return_codes):
+             final_success = False
+
+        if not final_success:
+            print_warning("Pipeline completed but some steps failed, timed out, or did not finish correctly.")
         elif timed_out:
              print_error("Pipeline terminated due to timeout.")
-             success = False
+             final_success = False
+
 
         # If pipeline failed and an output file was specified, try to remove it
-        if not success and output_file and output_file.exists():
+        if not final_success and output_file and output_file.exists():
              print_warning(f"Attempting to remove incomplete output file: {output_file}")
              try: output_file.unlink()
              except OSError as del_err: print_warning(f"Could not remove file: {del_err}")
 
 
-        return success
+        return final_success
 
     except FileNotFoundError as e:
         print_error(f"Error in pipeline: Command '{e.filename}' not found.")
         # Cleanup already attempted processes
         for info in process_info:
-            try: info['proc'].terminate()
+            try: info['proc'].kill() # Kill directly if setup failed
             except Exception: pass
-        if final_output_handle: final_output_handle.close()
+        if final_output_handle:
+             try: final_output_handle.close()
+             except: pass
         # Attempt to remove potentially created file
         if output_file and output_file.exists():
             try: output_file.unlink()
@@ -332,9 +406,11 @@ def run_pipeline(commands, step_names=None, pv_options=None, output_file=None):
     except Exception as e:
         print_error(f"Unexpected error during pipeline setup or execution: {e}")
         for info in process_info:
-            try: info['proc'].terminate()
+            try: info['proc'].kill()
             except Exception: pass
-        if final_output_handle: final_output_handle.close()
+        if final_output_handle:
+            try: final_output_handle.close()
+            except: pass
         if output_file and output_file.exists():
             try: output_file.unlink()
             except OSError: pass
@@ -353,7 +429,7 @@ def format_bytes(b):
         if unit == 'B': return f"{int(val)} {unit}"
         elif unit in ['KB', 'MB']: return f"{val:.1f} {unit}"
         else: return f"{val:.2f} {unit}"
-    except (ValueError, TypeError, OverflowError):
+    except (ValueError, TypeError, OverflowError,):
         return "N/A"
 
 
@@ -486,7 +562,6 @@ def get_snapshot_size_estimate(snapshot_name):
 def adjust_config_file(conf_path, instance_type, new_id=None, target_pve_storage=None, dataset_map=None, name_prefix="clone-"):
     """
     Nimmt Anpassungen an einer Konfigurationsdatei für Klonen oder Wiederherstellen vor.
-
     Args:
         conf_path (Path): Path to the configuration file to adjust.
         instance_type (str): 'vm' or 'lxc'.
@@ -637,12 +712,10 @@ def adjust_config_file(conf_path, instance_type, new_id=None, target_pve_storage
 def find_zfs_datasets(conf_path, pve_storage_name, zfs_pool_path):
     """
     Findet ZFS-Datasets, die in einer Konfigurationsdatei für ein bestimmtes Storage referenziert werden.
-
     Args:
         conf_path (Path): Path to the Proxmox config file.
         pve_storage_name (str): The name of the PVE storage backend (e.g., 'local-zfs').
         zfs_pool_path (str): The base path of the ZFS pool (e.g., 'rpool/data').
-
     Returns:
         tuple: (dict, str) where dict maps config keys to full dataset paths,
                and str is 'vm' or 'lxc'.
@@ -808,8 +881,8 @@ def select_snapshot(ref_dataset):
         try:
             idx_input = input("Enter the index of the snapshot to use: ").strip()
             if not idx_input:
-                 print_error("No index entered. Please select a snapshot.")
-                 continue
+                print_error("No index entered. Please select a snapshot.")
+                continue
             idx = int(idx_input)
             if 0 <= idx < len(snapshots):
                 selected_snapshot_info = snapshots[idx]
@@ -821,6 +894,7 @@ def select_snapshot(ref_dataset):
                 return selected_snapshot_full_name, snap_suffix
             else: print_error(f"Index out of range (must be 0 to {len(snapshots)-1}).")
         except ValueError: print_error("Invalid input. Please enter a number.")
+        except EOFError: print_error("\nOperation aborted by user (EOF).", exit_code=1)
 
 
 def generate_new_dataset_name(old_dataset_path, old_id, new_id, target_zfs_pool_path):
@@ -1019,7 +1093,7 @@ def do_clone(args):
                  print_success("    Full clone (send/receive) successful.")
                  op_success = True
             else:
-                 # Error message printed by run_pipeline
+                # Error message printed by run_pipeline
                  print_error("    Error during 'zfs send/receive' pipeline.")
                  all_ops_successful = False
                  # Do not proceed further if a clone fails
@@ -1092,9 +1166,27 @@ def do_export(args):
     print_info("=== Running Export Mode ===")
     src_id = args.source_id
     parent_export_dir = Path(args.export_dir)
+    compress_method = args.compress
     # Use specific source paths for export
     source_zfs_pool_path = args.source_zfs_pool_path
     source_pve_storage = args.source_pve_storage
+
+    # --- Check Compression Tool Availability ---
+    # _ ignores decompress_ok as it's not needed for export itself
+    compress_ok, _, compress_tool_info = check_compression_tools(compress_method)
+
+    # This check ensures compress_tool_info is a dictionary before proceeding.
+    # It should catch internal errors from check_compression_tools if any.
+    if compress_tool_info is None:
+        print_error(f"Failed to get compression tool info for method '{compress_method}'. Aborting export.", exit_code=1)
+
+    # Check if the *required* tool for the *selected* non-none method is available
+    if compress_method != "none" and not compress_ok:
+        # Tool specific warning was already printed by check_compression_tools
+        print_error(f"Required compression tool for method '{compress_method}' not found. Aborting export.", exit_code=1)
+
+    if compress_method != "none":
+         print_info(f"Using compression method: {compress_method}")
 
     # --- Define and Create Export Directory ---
     # Create a subdirectory named after the source ID
@@ -1151,7 +1243,10 @@ def do_export(args):
     for key, dataset_path in storage_datasets.items():
         # Construct snapshot name for the current dataset
         target_snapshot = f"{dataset_path}@{snap_suffix}"
-        stream_filename = f"{key}{DEFAULT_EXPORT_DATA_SUFFIX}"
+
+        # Determine output filename based on compression
+        data_suffix = compress_tool_info["suffix"]
+        stream_filename = f"{key}{data_suffix}"
         data_export_path = export_dir / stream_filename
 
         print(f"\n {color_text(f'Exporting {key}:', 'CYAN')}")
@@ -1166,9 +1261,9 @@ def do_export(args):
 
         estimated_size_bytes = get_snapshot_size_estimate(target_snapshot)
         size_str = f"~{format_bytes(estimated_size_bytes)}" if estimated_size_bytes is not None else "Unknown size"
-        print(f"    Estimated size: {size_str}")
+        print(f"    Estimated raw size: {size_str}")
 
-        # Prepare commands for pipeline: zfs send | pv > file
+        # Prepare commands for pipeline: zfs send | [pv] | [compressor] > file
         send_cmd = ['zfs', 'send', target_snapshot]
         pipeline_cmds = [send_cmd]
         pipeline_names = ["zfs send"]
@@ -1184,6 +1279,12 @@ def do_export(args):
         else:
             print_warning("    Executing export without progress bar ('pv' not found).")
 
+        # Add compression command if needed
+        if compress_method != "none":
+            compress_cmd = compress_tool_info["compress"]
+            pipeline_cmds.append(compress_cmd)
+            pipeline_names.append(compress_method) # Use method name for step name
+
         # Execute pipeline with output redirection to file
         print(f"    Executing pipeline: {' | '.join([' '.join(c) for c in pipeline_cmds])} > {data_export_path}")
         pipeline_successful = run_pipeline(pipeline_cmds, pipeline_names, pv_options=pv_opts, output_file=data_export_path)
@@ -1194,7 +1295,8 @@ def do_export(args):
                  'key': key,
                  'original_dataset_basename': Path(dataset_path).name, # Store original basename
                  'original_dataset_path': dataset_path, # Store full original path too
-                 'stream_file': stream_filename
+                 'stream_file': stream_filename,
+                 'stream_suffix': data_suffix # Store the suffix used
              })
         else:
             print_error(f"    Error during ZFS data export for {key}.")
@@ -1219,7 +1321,7 @@ def do_export(args):
 
     metadata = {
         "exported_at": datetime.now().isoformat(),
-        "script_version": "pve-zfs-utility-v_adjusted", # Add a version marker if desired
+        "script_version": "pve-zfs-utility-v_compressed", # Add a version marker
         "source_id": src_id,
         "source_instance_type": src_instance_type,
         "source_config_file": config_export_path.name,
@@ -1227,6 +1329,7 @@ def do_export(args):
         "source_zfs_pool_path": source_zfs_pool_path, # Record the source pool used
         "snapshot_suffix": snap_suffix,
         "reference_snapshot_name": ref_snapshot_name, # Full name of the ref snapshot used for selection
+        "compression_method": compress_method, # Store the compression method used
         "exported_disks": exported_disks_metadata # List of dicts for successfully exported disks
     }
     try:
@@ -1240,6 +1343,8 @@ def do_export(args):
     # --- Final Message ---
     print(f"\n{color_text('--- Export Process Finished ---', 'GREEN' if all_data_ops_successful else 'YELLOW')}")
     print(f"Exported {config_type_str} ID {src_id} (using snapshot suffix '{snap_suffix}')")
+    if compress_method != "none":
+        print(f"  Compression:      {compress_method}")
     print(f"  Target Directory: {export_dir}")
     print(f"  Config File:      {config_export_path.name}")
     print(f"  Metadata File:    {meta_export_path.name}")
@@ -1285,6 +1390,8 @@ def do_restore(args):
     # --- Read Metadata ---
     print_info(f"Reading metadata from: {meta_import_path.name}")
     metadata = None
+    compress_method = "none" # Default if not in metadata
+    decompress_tool_info = None
     try:
         with open(meta_import_path, 'r') as f_meta:
             metadata = json.load(f_meta)
@@ -1294,6 +1401,7 @@ def do_restore(args):
         original_id = metadata.get("source_id")
         original_instance_type = metadata.get("source_instance_type")
         exported_disks = metadata.get("exported_disks") # This is a list of dicts
+        compress_method = metadata.get("compression_method", "none") # Get compression method
 
         if not original_id: raise ValueError("Missing 'source_id' in metadata.")
         if not original_instance_type or original_instance_type not in ['vm', 'lxc']:
@@ -1301,15 +1409,23 @@ def do_restore(args):
         if exported_disks is None: raise ValueError("Missing 'exported_disks' list in metadata.")
         if not isinstance(exported_disks, list):
              raise ValueError("'exported_disks' in metadata is not a list.")
+        if compress_method not in COMPRESSION_TOOLS:
+             raise ValueError(f"Invalid 'compression_method' ('{compress_method}') found in metadata.")
 
         # Check keys within exported_disks list
         for i, disk_info in enumerate(exported_disks):
              if not disk_info.get("key"): raise ValueError(f"Disk entry {i} missing 'key'.")
              if not disk_info.get("original_dataset_basename"): raise ValueError(f"Disk entry {i} missing 'original_dataset_basename'.")
              if not disk_info.get("stream_file"): raise ValueError(f"Disk entry {i} missing 'stream_file'.")
+             # Optional: check if stream_suffix matches compression method
+             expected_suffix = COMPRESSION_TOOLS[compress_method]["suffix"]
+             if disk_info.get("stream_suffix") != expected_suffix:
+                 print_warning(f"Stream suffix '{disk_info.get('stream_suffix')}' for key '{disk_info['key']}' does not match expected suffix '{expected_suffix}' for compression '{compress_method}'.")
+
 
         print(f"   Original ID:       {original_id}")
         print(f"   Original Type:     {original_instance_type.upper()}")
+        print(f"   Compression:       {compress_method}")
         print(f"   Disks in export:   {len(exported_disks)}")
 
     except json.JSONDecodeError:
@@ -1318,6 +1434,12 @@ def do_restore(args):
          print_error(f"Invalid or incomplete metadata in {meta_import_path}: {ve}", exit_code=1)
     except Exception as e:
         print_error(f"Failed to read or parse metadata file {meta_import_path}: {e}", exit_code=1)
+
+    # --- Check Decompression Tool Availability ---
+    _, decompress_ok, decompress_tool_info = check_compression_tools(compress_method)
+    if compress_method != "none" and not decompress_ok:
+        print_error(f"Required decompression tool for method '{compress_method}' not found. Aborting restore.", exit_code=1)
+
 
     # --- Find Config File ---
     # Use filename from metadata if present, otherwise construct default
@@ -1417,27 +1539,41 @@ def do_restore(args):
                 all_data_ops_successful = False
                 break # Stop restore if a required data file is missing
 
-            # Prepare pipeline: cat file | pv | zfs receive
+            # Prepare pipeline: cat file | [decompressor] | [pv] | zfs receive
             recv_cmd = ['zfs', 'receive', '-o', 'readonly=off', new_dataset_path] # Ensure dataset is writable
             pipeline_cmds = []
             pipeline_names = []
             pv_opts = None
 
             # Use 'cat' to feed the file into the pipeline
-            cat_cmd = ['cat', str(data_import_path)]
+            # Important: Ensure cat reads the specific file path!
+            cat_cmd = ['cat', str(data_import_path)] # Use str() to ensure it's a string path
             pipeline_cmds.append(cat_cmd)
             pipeline_names.append("cat")
 
+            # Add decompression command if needed
+            if compress_method != "none":
+                decompress_cmd = decompress_tool_info["decompress"]
+                pipeline_cmds.append(decompress_cmd)
+                pipeline_names.append(f"decompress ({compress_method})")
+
             if pv_available:
                 pv_cmd_base = ['pv']
-                try: file_size = data_import_path.stat().st_size
-                except Exception: file_size = None
-                size_str = f"~{format_bytes(file_size)}" if file_size is not None else "Unknown size"
+                # Size estimation for PV is tricky with compression.
+                # We can use the compressed file size, but PV will track uncompressed data.
+                # Or we can omit size for PV during decompression. Let's omit it.
+                try:
+                    file_size = data_import_path.stat().st_size
+                    size_str = f"~{format_bytes(file_size)} (compressed)"
+                except Exception:
+                    file_size = None
+                    size_str = "Unknown size"
                 print(f"    Input file size: {size_str}")
 
                 # Add -W (wait) might be good practice
                 pv_opts = ['-W', '-p', '-t', '-r', '-b', '-N', f'restore-{original_key}']
-                if file_size: pv_opts.extend(['-s', str(file_size)])
+                # Do NOT add -s size for decompression, as PV tracks uncompressed bytes
+                # if file_size: pv_opts.extend(['-s', str(file_size)])
                 pipeline_cmds.append(pv_cmd_base)
                 pipeline_names.append("pv")
             else:
@@ -1454,9 +1590,8 @@ def do_restore(args):
                 restored_datasets_map[original_key] = Path(new_dataset_path).name # Store basename for config
                 cleanup_list.append(new_dataset_path) # Add to cleanup list
             else:
-                print_error(f"Error during 'zfs receive' pipeline for {original_key}. Aborting restore.")
+                print_error(f"Error during ZFS data restore pipeline for {original_key}. Aborting restore.")
                 all_data_ops_successful = False
-                # Attempt to remove the failed dataset immediately? Or cleanup all at the end?
                 # Let's break and cleanup all successfully created ones so far.
                 break
 
@@ -1613,7 +1748,7 @@ def perform_ram_check(pve_cmd, src_id):
 
         # Perform the check and warn user
         threshold_mb = math.floor(total_ram_mb * RAM_THRESHOLD_PERCENT / 100)
-        print(f"   Total host RAM:      {color_text(format_bytes(total_ram_mb*1024*1024), 'BLUE')}")
+        print(f"    Total host RAM:      {color_text(format_bytes(total_ram_mb*1024*1024), 'BLUE')}")
         if sum_running_ram_mb >= 0:
             print(f"   RAM running VMs (sum):{color_text(format_bytes(sum_running_ram_mb*1024*1024), 'BLUE')}")
             print(f"   Source VM RAM (Est.):{color_text(format_bytes(src_vm_ram_mb*1024*1024), 'BLUE')}")
@@ -1624,11 +1759,11 @@ def perform_ram_check(pve_cmd, src_id):
             if prognostic_ram_mb > threshold_mb:
                 print_warning(f"\nWARNING: Starting the clone might exceed the {RAM_THRESHOLD_PERCENT}% host RAM usage threshold!")
                 try:
-                     confirm = input(f"{color_text('Continue anyway? (y/N) ', 'RED')}{COLORS['NC']}").strip().lower()
-                     if confirm not in ['y', 'yes']:
-                         print_error("Operation aborted by user due to RAM concerns.", exit_code=1)
-                     else:
-                         print_info("Continuing despite RAM warning.")
+                    confirm = input(f"{color_text('Continue anyway? (y/N) ', 'RED')}{COLORS['NC']}").strip().lower()
+                    if confirm not in ['y', 'yes']:
+                        print_error("Operation aborted by user due to RAM concerns.", exit_code=1)
+                    else:
+                        print_info("Continuing despite RAM warning.")
                 except EOFError: # Handle non-interactive session
                      print_error("Operation aborted due to RAM concerns (non-interactive).", exit_code=1)
             else: print_success("RAM check passed.")
@@ -1646,6 +1781,7 @@ def perform_ram_check(pve_cmd, src_id):
 def main():
     # --- Argument Parser Setup ---
     # Add epilog for usage examples
+    compress_options = list(COMPRESSION_TOOLS.keys())
     examples = f"""
 Examples:
 
@@ -1661,10 +1797,16 @@ Examples:
   {color_text('Clone VM 102, prompt for new ID and snapshot (linked, uses default storage/pool):', 'YELLOW')}
     sudo {sys.argv[0]} clone 102
 
-  {color_text('Export VM 101 to /mnt/backup/export/101 (prompts for snapshot, specify source storage/pool):', 'YELLOW')}
-    sudo {sys.argv[0]} export 101 /mnt/backup/export --source-pve-storage local-zfs --source-zfs-pool-path rpool/data
+  {color_text('Export VM 101 to /mnt/backup/export/101 (uncompressed, prompts for snapshot):', 'YELLOW')}
+    sudo {sys.argv[0]} export 101 /mnt/backup/export
 
-  {color_text('Restore from /mnt/backup/export/101 to new ID 8101 (uses default target storage/pool):', 'YELLOW')}
+  {color_text('Export LXC 105 to /mnt/backup/export/105 (using zstd compression):', 'YELLOW')}
+    sudo {sys.argv[0]} export 105 /mnt/backup/export --compress zstd
+
+  {color_text('Export VM 101, specify source storage/pool and use pigz compression:', 'YELLOW')}
+    sudo {sys.argv[0]} export 101 /mnt/backup/export --source-pve-storage local-zfs --source-zfs-pool-path rpool/data --compress pigz
+
+  {color_text('Restore from /mnt/backup/export/101 to new ID 8101 (auto-detects compression, uses default target storage/pool):', 'YELLOW')}
     sudo {sys.argv[0]} restore /mnt/backup/export/101 8101
 
   {color_text('Restore from /mnt/backup/export/105, prompt for new ID, specify target storage/pool:', 'YELLOW')}
@@ -1676,7 +1818,7 @@ Configuration Note:
   (These can be overridden using the --target-zfs-pool-path and --target-pve-storage options.)
 """
     parser = argparse.ArgumentParser(
-        description="Proxmox VM/LXC Clone, Export, or Restore script using ZFS snapshots.",
+        description="Proxmox VM/LXC Clone, Export, or Restore script using ZFS snapshots with optional compression.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=examples
     )
@@ -1691,7 +1833,7 @@ Configuration Note:
 
 
     # --- Subparsers for Modes ---
-    subparsers = parser.add_subparsers(dest='mode', help='Operation mode (clone, export, restore)')
+    subparsers = parser.add_subparsers(dest='mode', help='Operation mode (clone, export, restore)', required=True) # Make mode required
 
     # --- Clone Mode ---
     parser_clone = subparsers.add_parser('clone', help='Clone a VM/LXC from a ZFS snapshot.', formatter_class=argparse.RawTextHelpFormatter)
@@ -1702,10 +1844,12 @@ Configuration Note:
                               help="Type of ZFS clone ('linked' uses 'zfs clone', 'full' uses send/receive). Default: linked")
 
     # --- Export Mode ---
-    parser_export = subparsers.add_parser('export', help='Export a VM/LXC config and ZFS snapshot data.', formatter_class=argparse.RawTextHelpFormatter)
+    parser_export = subparsers.add_parser('export', help='Export a VM/LXC config and ZFS snapshot data (optionally compressed).', formatter_class=argparse.RawTextHelpFormatter)
     parser_export.add_argument('source_id', help="ID of the source VM or LXC to export.")
     parser_export.add_argument('export_dir',
                                help="Parent directory where the export subdirectory (named after source_id) will be created (e.g., /mnt/backups).")
+    parser_export.add_argument('--compress', choices=compress_options, default='none',
+                               help=f"Compression method for ZFS streams. Default: none")
     # Keep source arguments specific to export
     parser_export.add_argument('--source-zfs-pool-path', default=DEFAULT_ZFS_POOL_PATH,
                                help=f"Base path where source ZFS datasets reside. Default: {DEFAULT_ZFS_POOL_PATH}")
@@ -1714,9 +1858,9 @@ Configuration Note:
 
 
     # --- Restore Mode ---
-    parser_restore = subparsers.add_parser('restore', help='Restore a VM/LXC from an exported directory.', formatter_class=argparse.RawTextHelpFormatter)
+    parser_restore = subparsers.add_parser('restore', help='Restore a VM/LXC from an exported directory (auto-detects compression).', formatter_class=argparse.RawTextHelpFormatter)
     parser_restore.add_argument('import_dir',
-                                help="Path to the specific export directory containing the .conf, .meta.json, and .zfs.stream files (e.g., /mnt/backups/101).")
+                                help="Path to the specific export directory containing the .conf, .meta.json, and data stream files (e.g., /mnt/backups/101).")
     parser_restore.add_argument('new_id', nargs='?', default=None,
                                 help="ID for the new restored instance. (Default: 8<original_id>, will prompt if omitted)")
 
@@ -1733,9 +1877,10 @@ Configuration Note:
              sys.exit(1) # Exit if listing failed somehow
 
     # --- Mode selection needed if --list wasn't used ---
-    if not args.mode:
-        parser.print_help()
-        print_error("\nError: You must specify an operation mode (clone, export, restore) or use --list.", exit_code=1)
+    # (Now handled by subparsers(required=True))
+    # if not args.mode:
+    #     parser.print_help()
+    #     print_error("\nError: You must specify an operation mode (clone, export, restore) or use --list.", exit_code=1)
 
 
     # --- Initial Checks (only if a mode is selected) ---
@@ -1770,6 +1915,8 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print_error("\nOperation cancelled by user (Ctrl+C).", exit_code=130) # Standard exit code for Ctrl+C
+    except EOFError: # Catch unexpected EOF during input prompts
+        print_error("\nOperation aborted due to unexpected end of input.", exit_code=1)
     except Exception as e:
         print_error(f"\nAn unexpected critical error occurred: {e}")
         # Uncomment the next two lines for detailed debugging traceback
