@@ -1833,7 +1833,7 @@ Configuration Note:
 
 
     # --- Subparsers for Modes ---
-    subparsers = parser.add_subparsers(dest='mode', help='Operation mode (clone, export, restore)', required=True) # Make mode required
+    subparsers = parser.add_subparsers(dest='mode', help='Operation mode (clone, export, restore)', required=False) # Make mode optional
 
     # --- Clone Mode ---
     parser_clone = subparsers.add_parser('clone', help='Clone a VM/LXC from a ZFS snapshot.', formatter_class=argparse.RawTextHelpFormatter)
@@ -1872,15 +1872,14 @@ Configuration Note:
         if os.geteuid() != 0:
             print_warning("Root privileges might be needed to read all config files for listing.")
         if list_instances():
-             sys.exit(0)
+            sys.exit(0)
         else:
-             sys.exit(1) # Exit if listing failed somehow
+            sys.exit(1) # Exit if listing failed somehow
 
-    # --- Mode selection needed if --list wasn't used ---
-    # (Now handled by subparsers(required=True))
-    # if not args.mode:
-    #     parser.print_help()
-    #     print_error("\nError: You must specify an operation mode (clone, export, restore) or use --list.", exit_code=1)
+    # --- Mode selection needed if --list wasn't used
+    if not args.mode:
+        parser.print_help()
+        print_error("\nError: You must specify an operation mode (clone, export, restore) if not using --list.", exit_code=1) # <<< NEU EINFÜGEN
 
 
     # --- Initial Checks (only if a mode is selected) ---
