@@ -39,11 +39,11 @@ chmod +x pve-zfs-utility.py
 
 *   Supports both **VMs and LXC containers**.
 *   Modes:
-    *   **`clone`**: Create linked (default) or full clones from **multiple selected snapshots**.
-    *   **`export`**: Export VM/LXC configuration and ZFS data stream(s) from **multiple snapshots** to separate directories.
-    *   **`restore`**: Restore a VM/LXC from a **specific exported snapshot directory** to a new ID.
+    *   **`clone`**: Create linked (default) or full clones from multiple selected snapshots.
+    *   **`export`**: Export VM/LXC configuration and ZFS data stream(s) from multiple snapshots to separate directories.
+    *   **`restore`**: Restore a VM/LXC from a specific exported snapshot directory to a new ID.
     *   **`--list`**: List available VMs and LXCs.
-*   Interactive CLI with **multi-snapshot selection** and color-coded output.
+*   Interactive CLI with multi-snapshot selection and color-coded output.
 *   Command-line argument parsing (`argparse`) for non-interactive use.
 *   Automatic configuration adjustments for clones/restores:
     *   Adds "clone-" or "restored-" prefix to names/hostnames.
@@ -54,7 +54,7 @@ chmod +x pve-zfs-utility.py
 *   RAM usage verification before VM cloning (configurable threshold).
 *   Collision detection for target VM/LXC IDs and ZFS datasets.
 *   Progress display for data operations (full clone, export, restore) when `pv` is available.
-*   Export creates **structured directories per snapshot** with `.conf`, `.meta.json`, and compressed `.zfs.stream` files.
+*   Export creates structured directories per snapshot with `.conf`, `.meta.json`, and compressed `.zfs.stream` files.
 
 ## 🚀 Usage
 
