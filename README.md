@@ -2,7 +2,7 @@
 
 ![Python Version 3.7+](https://img.shields.io/badge/Python-3.7%2B-blue) ![License GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-green)
 
-This Python script provides command-line utilities for managing Proxmox Virtual Machines (VMs) and LXC containers using ZFS snapshots. It supports cloning (linked and full), exporting configurations and data streams, and restoring from exports.
+This Python script provides command-line utilities for managing Proxmox Virtual Machines (VMs) and LXC containers using ZFS snapshots. It supports cloning (linked and full), exporting configurations and data streams, and restoring from exports with **multi-snapshot support**.
 
 ## ⚠️ Critical Warning
 
@@ -39,11 +39,11 @@ chmod +x pve-zfs-utility.py
 
 *   Supports both **VMs and LXC containers**.
 *   Modes:
-    *   **`clone`**: Create linked (default) or full clones from existing snapshots.
-    *   **`export`**: Export VM/LXC configuration and ZFS data stream(s) from a snapshot to a directory.
-    *   **`restore`**: Restore a VM/LXC from an exported directory to a new ID.
+    *   **`clone`**: Create linked (default) or full clones from **multiple selected snapshots**.
+    *   **`export`**: Export VM/LXC configuration and ZFS data stream(s) from **multiple snapshots** to separate directories.
+    *   **`restore`**: Restore a VM/LXC from a **specific exported snapshot directory** to a new ID.
     *   **`--list`**: List available VMs and LXCs.
-*   Interactive CLI with color-coded output (prompts for IDs/snapshots if not provided via arguments).
+*   Interactive CLI with **multi-snapshot selection** and color-coded output.
 *   Command-line argument parsing (`argparse`) for non-interactive use.
 *   Automatic configuration adjustments for clones/restores:
     *   Adds "clone-" or "restored-" prefix to names/hostnames.
@@ -54,12 +54,11 @@ chmod +x pve-zfs-utility.py
 *   RAM usage verification before VM cloning (configurable threshold).
 *   Collision detection for target VM/LXC IDs and ZFS datasets.
 *   Progress display for data operations (full clone, export, restore) when `pv` is available.
-*   Support for standard ZFS snapshot naming conventions (including `zfs-auto-snapshot`).
-*   Export creates a structured directory with `.conf`, `.meta.json`, and `.zfs.stream` files.
+*   Export creates **structured directories per snapshot** with `.conf`, `.meta.json`, and compressed `.zfs.stream` files.
 
 ## 🚀 Usage
 
-The script now uses command-line arguments to define the operation mode and parameters.
+The script uses command-line arguments to define the operation mode and parameters.
 
 ### General Syntax:
 
@@ -91,59 +90,28 @@ sudo ./pve-zfs-utility.py [global_options] <mode> [mode_options]
     ./pve-zfs-utility.py --list
     ```
     
-2.  **Clone VM 100 to 9100 (linked, prompts for snapshot, uses default storage/pool):**
+2.  **Clone VM 100 with multiple snapshots (prompts for selection):**
     
     ```bash
     sudo ./pve-zfs-utility.py clone 100 9100
+    # Creates clones for each selected snapshot (e.g., 9100, 9101, etc.)
     ```
     
-3.  **Clone LXC 105 to 9105 (full clone, prompts for snapshot, specify target storage/pool):**
+3.  **Export LXC 105 with zstd compression (creates subdir per snapshot):**
     
     ```bash
-    sudo ./pve-zfs-utility.py clone 105 9105 --clone-mode full --target-pve-storage tank/pve --target-zfs-pool-path tank/pve/data
+    sudo ./pve-zfs-utility.py export 105 /mnt/backup --compress zstd
+    # Exports each selected snapshot to /mnt/backup/105_snapshotname
     ```
     
-4.  **Clone VM 102, prompt for new ID and snapshot (linked, uses default storage/pool):**
+4.  **Restore from specific snapshot directory:**
     
     ```bash
-    sudo ./pve-zfs-utility.py clone 102
-    ```
-    
-5.  **Export VM 101 (prompts for snapshot) to `/mnt/backup/export/101` (specify source storage/pool):**
-    
-    ```bash
-    # The script will create the '101' subdirectory inside /mnt/backup/export
-    sudo ./pve-zfs-utility.py export 101 /mnt/backup/export --source-pve-storage local-zfs --source-zfs-pool-path rpool/data
-    ```
-
-6.  **Export LXC 105 to /mnt/backup/export/105 using zstd compression**
-    
-    ```bash
-    sudo ./pve-zfs-utility.py export 105 /mnt/backup/export --compress zstd
-    ```
-
-7.  **Export VM 101 with specified source storage/pool using pigz compression**
-
-    ```bash
-    sudo ./pve-zfs-utility.py export 101 /mnt/backup/export --source-pve-storage local-zfs --source-zfs-pool-path rpool/data --compress pigz
-    ```    
-
-8.  **Restore from `/mnt/backup/export/101` to new ID 8101 (uses default target storage/pool):**
-    
-    ```bash
-    sudo ./pve-zfs-utility.py restore /mnt/backup/export/101 8101
-    ```
-    
-9.  **Restore from `/mnt/backup/export/105`, prompt for new ID, specify target storage/pool:**
-    
-    ```bash
-    sudo ./pve-zfs-utility.py restore /mnt/backup/export/105 --target-pve-storage tank/pve --target-zfs-pool-path tank/pve/data
+    sudo ./pve-zfs-utility.py restore /mnt/backup/105_autosnap_20231026 8101
     ```
     
 
 ## 🔧 Configuration Defaults
-
-The script uses these internal defaults, which can be overridden by command-line arguments for the relevant modes:
 
 *   `DEFAULT_ZFS_POOL_PATH = "rpool/data"` (Target for clone/restore, Source for export)
 *   `DEFAULT_PVE_STORAGE = "local-zfs"` (Target for clone/restore, Source for export)
@@ -163,7 +131,6 @@ This project is licensed under the GPL-3.0 License - see the [LICENSE](LICENSE) 
 *   Only operates on disks associated with the specified ZFS storage/pool in the config. Other storage types are ignored.
 *   RAM check before cloning is only performed for VMs.
 *   EFI disk handling relies on standard PVE configuration; manual verification after clone/restore is recommended.
-*   Export/Restore assumes the ZFS stream contains a single snapshot (no incremental support).
 
 ## 📄 Disclaimer
 
